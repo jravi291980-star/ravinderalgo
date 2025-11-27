@@ -1,10 +1,11 @@
 from django.db import models
 from django.utils import timezone
-from django.conf import settings  # Needed for accessing constants like IST
+from datetime import datetime
 import pytz # <-- CORRECTED IMPORT: pytz must be imported directly
 
-# Ensure IST timezone is available
-IST = timezone.pytz.timezone("Asia/Kolkata")
+# Ensure IST timezone is available for use in default values
+IST = pytz.timezone("Asia/Kolkata")
+
 
 
 class DhanCredentials(models.Model):
