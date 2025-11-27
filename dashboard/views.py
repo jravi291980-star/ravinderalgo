@@ -6,6 +6,8 @@ from datetime import datetime
 import redis
 import json
 import time
+import requests # Needed for REST API calls
+from dhanhq import DhanContext, dhanhq, DhanHQ # Import DhanHQ client class
 
 # --- FIX: Using CashBreakoutTrade model instead of LiveTrade ---
 from .models import DhanCredentials, StrategySettings, CashBreakoutTrade 
@@ -20,6 +22,17 @@ try:
 except Exception as e:
     print(f"REDIS CONNECTION ERROR (Dashboard): {e}")
     r = None 
+
+# --- Global Helper for Dhan Client Initialization ---
+def get_dhan_rest_client(client_id, access_token):
+    """Initializes and returns the Dhan REST client."""
+    try:
+        dhan_context = DhanContext(client_id, access_token)
+        return dhanhq(dhan_context)
+    except Exception as e:
+        print(f"Dhan Client Initialization Failed: {e}")
+        return None
+
 
 def dashboard_view(request):
     """Main dashboard for credentials, settings, and trade monitoring."""
@@ -37,7 +50,8 @@ def dashboard_view(request):
     except Exception as e:
         # If this fails, it is highly likely the database migration failed.
         print(f"DATABASE ERROR during StrategySettings lookup: {e}")
-        messages.error(request, f"Database table initialization failed. Run 'heroku run python manage.py migrate --app {settings.HEROKU_APP_NAME}'")
+        # Note: HEROKU_APP_NAME is not globally set in settings, fetch if needed for message
+        messages.error(request, f"Database table initialization failed. Run migrations.")
         strategy = None # Prevents further DB interaction if models fail to load
 
     if not strategy:
@@ -86,27 +100,43 @@ def dashboard_view(request):
         strategy_form = StrategySettingsForm(instance=strategy)
 
 
-    # 4. Token Generation Logic
+    # 4. Token Generation Logic (Integration with placeholder for API call)
     if request.method == 'POST' and 'generate_token' in request.POST and credentials.client_id:
         
-        if not credentials.client_id or credentials.client_id == 'Enter Client ID':
+        client_id = credentials.client_id
+        if not client_id or client_id == 'Enter Client ID':
             messages.error(request, "Please enter a valid Client ID before attempting token generation.")
-        else:
-            # NOTE: In a real environment, this function would involve a REST call to Dhan 
-            # using the Client ID to exchange for a fresh Access Token.
-            
-            # --- MOCK TOKEN GENERATION & DISTRIBUTION ---
-            new_token = f"DHAN_MOCK_TOKEN_{int(time.time())}_{credentials.client_id}" 
-            credentials.access_token = new_token
-            credentials.token_generation_time = timezone.now()
-            credentials.save()
-            
-            # Publish token update to all workers and save to a persistent Redis key
-            if r:
-                r.set(settings.REDIS_DHAN_TOKEN_KEY, new_token)
-                r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({'action': 'TOKEN_REFRESH', 'token': new_token}))
-            
-            messages.success(request, f"Access Token generated and distributed to workers. Token: {new_token[:15]}...")
+            return redirect('dashboard')
+
+        # --- DHAN API INTEGRATION PLACEHOLDER ---
+        # The user must provide the Authorization Code (obtained from Dhan's web flow)
+        # We assume for this implementation that the user pastes the code or the token here:
+        
+        # NOTE: A secure, fully implemented system would redirect the user to Dhan's login 
+        # page and handle the callback. Since we cannot do that, we use a mock.
+        
+        # However, to simulate the effect of a real API call generating a token, 
+        # we still update the DB and Redis with a MOCK token.
+        
+        new_token = f"DHAN_MOCK_TOKEN_{int(time.time())}_{client_id}" 
+
+        # --- MOCK API CALL SUCCESS ---
+        # In a real API, you would call: 
+        # dhan.public.get_access_token(client_id, authorization_code, redirect_uri)
+        # and extract the actual access_token.
+        # token_response = dhan.get_access_token(...)
+        # new_token = token_response.get('access_token')
+
+        credentials.access_token = new_token
+        credentials.token_generation_time = timezone.now()
+        credentials.save()
+        
+        # Publish token update to all workers and save to a persistent Redis key
+        if r:
+            r.set(settings.REDIS_DHAN_TOKEN_KEY, new_token)
+            r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({'action': 'TOKEN_REFRESH', 'token': new_token}))
+        
+        messages.success(request, f"Access Token generated (MOCK) and distributed to workers. Token: {new_token[:15]}...")
         return redirect('dashboard')
         
     # 5. Live Trade Status and Monitoring
