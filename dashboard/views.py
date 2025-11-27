@@ -1,55 +1,53 @@
-from django.shortcuts import render, redirect, get_object_or_404
+from django.shortcuts import render, redirect
 from django.conf import settings
 from django.contrib import messages
-from .models import DhanCredentials, StrategySettings, LiveTrade
-from .forms import DhanCredentialsForm, StrategySettingsForm
+from django.utils import timezone
+from datetime import datetime, timedelta
 import redis
 import json
 import time
 
-# Initialize Redis connection for reading/writing status
+# --- FIX: Renamed LiveTrade to CashBreakoutTrade ---
+from .models import DhanCredentials, StrategySettings, CashBreakoutTrade
+from .forms import DhanCredentialsForm, StrategySettingsForm
+
+# Initialize Redis connection (read-only for dashboard status)
 try:
-    # Use the REDIS_URL from settings
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 except Exception as e:
-    # Handle connection error gracefully
-    print(f"REDIS CONNECTION ERROR: {e}")
-    r = None  # Set to None if connection fails
+    print(f"REDIS CONNECTION ERROR (Dashboard): {e}")
+    r = None
 
 
 def dashboard_view(request):
     """Main dashboard for credentials, settings, and trade monitoring."""
 
-    # 1. Handle Credentials Management
+    # 1. Ensure Strategy Settings exist
+    strategy, created = StrategySettings.objects.get_or_create(
+        name='Cash Breakout Strategy',
+        defaults={'is_enabled': False}
+    )
+
+    # 2. Handle Credentials Management
     try:
         credentials = DhanCredentials.objects.get(is_active=True)
     except DhanCredentials.DoesNotExist:
-        credentials = None
+        credentials = DhanCredentials(client_id=settings.DHAN_CLIENT_ID or 'Enter Client ID')
 
     if request.method == 'POST' and 'update_credentials' in request.POST:
-        if credentials:
-            form = DhanCredentialsForm(request.POST, instance=credentials)
-        else:
-            form = DhanCredentialsForm(request.POST)
-
+        form = DhanCredentialsForm(request.POST, instance=credentials)
         if form.is_valid():
             creds = form.save(commit=False)
             creds.is_active = True
             creds.save()
-            messages.success(request, "Dhan Credentials updated successfully.")
+            messages.success(request, "Dhan Client ID updated.")
             return redirect('dashboard')
         else:
             messages.error(request, "Error saving credentials.")
     else:
         form = DhanCredentialsForm(instance=credentials)
 
-    # 2. Handle Strategy Settings
-    try:
-        strategy = StrategySettings.objects.get(name='MY_FIRST_ALGO')
-    except StrategySettings.DoesNotExist:
-        # Create a default strategy instance if it doesn't exist
-        strategy = StrategySettings.objects.create(name='MY_FIRST_ALGO')
-
+    # 3. Handle Strategy Settings
     if request.method == 'POST' and 'update_strategy' in request.POST:
         strategy_form = StrategySettingsForm(request.POST, instance=strategy)
         if strategy_form.is_valid():
@@ -58,8 +56,7 @@ def dashboard_view(request):
 
             # --- NOTIFY ALGO ENGINES VIA REDIS ---
             if r:
-                r.publish('strategy_control_channel', json.dumps({
-                    'strategy_id': strategy.id,
+                r.publish(settings.REDIS_CONTROL_CHANNEL, json.dumps({
                     'action': 'UPDATE_CONFIG'
                 }))
 
@@ -69,32 +66,36 @@ def dashboard_view(request):
     else:
         strategy_form = StrategySettingsForm(instance=strategy)
 
-    # 3. Live Trade Status and Monitoring
-    live_trades = LiveTrade.objects.filter(status__in=['PENDING', 'OPEN']).order_by('-timestamp')
+    # 4. Token Generation (Placeholder function)
+    if request.method == 'POST' and 'generate_token' in request.POST and credentials.client_id:
+        # In a real app, this requires a REST call to Dhan to generate the token
 
-    # 4. Global Status Check (from Redis)
-    data_engine_status = r.get('data_engine_status') if r else 'N/A'
-    algo_engine_status = r.get('algo_engine_status') if r else 'N/A'
+        if not credentials.client_id or credentials.client_id == 'Enter Client ID':
+            messages.error(request, "Please enter a valid Client ID before attempting token generation.")
+        else:
+            # --- MOCK TOKEN GENERATION & DISTRIBUTION ---
+            new_token = f"DHAN_MOCK_TOKEN_{int(time.time())}"
+            credentials.access_token = new_token
+            credentials.token_generation_time = timezone.now()
+            credentials.save()
 
-    # 5. Token Generation (Placeholder function)
-    if request.method == 'POST' and 'generate_token' in request.POST and credentials:
-        # NOTE: In a real app, this would trigger a background task
-        # using the dhanhq library to generate/refresh the access_token
-        # using the credentials.
+            # Publish token update to all workers
+            if r:
+                r.set(settings.REDIS_DHAN_TOKEN_KEY, new_token)
+                r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({'action': 'TOKEN_REFRESH', 'token': new_token}))
 
-        # Placeholder logic:
-        new_token = f"TOKEN-{int(time.time())}"  # Mock token
-        credentials.access_token = new_token
-        credentials.token_generation_time = timezone.now()
-        credentials.save()
-
-        # Publish token update to all workers
-        if r:
-            r.set('dhan_access_token', new_token)
-            r.publish('auth_channel', json.dumps({'action': 'TOKEN_REFRESH', 'token': new_token}))
-
-        messages.success(request, f"Access Token generated and distributed to workers.")
+            messages.success(request, f"Access Token generated and distributed to workers. Token: {new_token[:10]}...")
         return redirect('dashboard')
+
+    # 5. Live Trade Status and Monitoring
+    # --- FIX: Using CashBreakoutTrade model ---
+    live_trades = CashBreakoutTrade.objects.filter(
+        status__in=['PENDING_ENTRY', 'OPEN', 'PENDING_EXIT']
+    ).order_by('-created_at')
+
+    # 6. Global Status Check (from Redis)
+    data_engine_status = r.get(settings.REDIS_STATUS_DATA_ENGINE) if r else 'N/A'
+    algo_engine_status = r.get(settings.REDIS_STATUS_ALGO_ENGINE) if r else 'N/A'
 
     context = {
         'form': form,
@@ -105,7 +106,3 @@ def dashboard_view(request):
         'algo_engine_status': algo_engine_status,
     }
     return render(request, 'dashboard/index.html', context)
-
-
-# Remember to import timezone if needed for token generation:
-from django.utils import timezone
