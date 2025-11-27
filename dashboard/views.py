@@ -7,12 +7,12 @@ import redis
 import json
 import time
 import requests # Needed for REST API calls
-from dhanhq import DhanContext, dhanhq, DhanHQ # Import DhanHQ client class
+from dhanhq import dhanhq # Core client function
+from dhanhq.dhanhq import DhanContext # Importing Context explicitly from submodule
 
 # --- FIX: Using CashBreakoutTrade model instead of LiveTrade ---
 from .models import DhanCredentials, StrategySettings, CashBreakoutTrade 
 from .forms import DhanCredentialsForm, StrategySettingsForm
-
 # Initialize Redis connection (read-only for dashboard status)
 try:
     # CRITICAL FIX: Add ssl_cert_reqs=None and decode_responses=True for Heroku Redis SSL connection
