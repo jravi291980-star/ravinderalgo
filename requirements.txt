@@ -1,0 +1,8 @@
+Django==5.0.*
+gunicorn
+dhanhq==2.0.*
+redis==5.0.*
+requests==2.31.*
+tenacity==8.2.*
+python-dotenv==1.0.*
+pytz==2024.1.*

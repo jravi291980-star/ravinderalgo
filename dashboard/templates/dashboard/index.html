@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dhan Algo-Trader Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .card { background: white; border-radius: 0.75rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06); }
+        .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+        .status-running { background-color: #a7f3d0; color: #065f46; } /* Green */
+        .status-down { background-color: #fecaca; color: #991b1b; } /* Red */
+        .status-na { background-color: #e5e7eb; color: #4b5563; } /* Gray */
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <h1 class="text-3xl font-bold mb-8 text-gray-800">Dhan Algo Trading Control Panel</h1>
+
+    {% for message in messages %}
+        <div class="card p-4 mb-4 {% if message.tags == 'success' %}bg-green-100 border-l-4 border-green-500 text-green-700{% elif message.tags == 'error' %}bg-red-100 border-l-4 border-red-500 text-red-700{% else %}bg-blue-100 border-l-4 border-blue-500 text-blue-700{% endif %}" role="alert">
+            {{ message }}
+        </div>
+    {% endfor %}
+
+    <div class="grid lg:grid-cols-3 gap-6 mb-8">
+        <!-- System Status Card -->
+        <div class="card p-6 lg:col-span-1">
+            <h2 class="text-xl font-semibold mb-4 text-gray-700">System Health</h2>
+            <div class="space-y-3 text-sm">
+                <div class="flex justify-between items-center">
+                    <span class="font-medium">Data Engine (Worker)</span>
+                    <span class="status-badge
+                        {% if data_engine_status == 'RUNNING' %}status-running
+                        {% elif data_engine_status == 'DOWN' %}status-down
+                        {% else %}status-na{% endif %}">
+                        {{ data_engine_status|default:"N/A" }}
+                    </span>
+                </div>
+                <div class="flex justify-between items-center">
+                    <span class="font-medium">Algo Engine (Algo)</span>
+                    <span class="status-badge
+                        {% if algo_engine_status == 'RUNNING' %}status-running
+                        {% elif algo_engine_status == 'DOWN' %}status-down
+                        {% else %}status-na{% endif %}">
+                        {{ algo_engine_status|default:"N/A" }}
+                    </span>
+                </div>
+                <div class="flex justify-between items-center">
+                    <span class="font-medium">Web Engine (Django)</span>
+                    <span class="status-badge status-running">RUNNING</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Credential & Token Card -->
+        <div class="card p-6 lg:col-span-2">
+            <h2 class="text-xl font-semibold mb-4 text-gray-700">Dhan API Credentials & Authentication</h2>
+
+            <form method="post" class="space-y-4">
+                {% csrf_token %}
+                <div class="grid sm:grid-cols-2 gap-4">
+                    {% for field in form %}
+                        <div class="flex flex-col">
+                            <label for="{{ field.id_for_label }}" class="mb-1 text-sm font-medium text-gray-600">{{ field.label }}</label>
+                            {{ field }}
+                            {% if field.errors %}
+                                <p class="text-red-500 text-xs mt-1">{{ field.errors|striptags }}</p>
+                            {% endif %}
+                        </div>
+                    {% endfor %}
+                </div>
+                <button type="submit" name="update_credentials" class="w-full sm:w-auto px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition duration-150 shadow-md">
+                    Save Credentials
+                </button>
+            </form>
+
+            {% if credentials %}
+            <div class="mt-6 pt-4 border-t border-gray-100 flex justify-between items-center">
+                <div class="text-sm text-gray-600">
+                    {% if credentials.access_token %}
+                        Last Token Gen: <span class="font-mono text-xs">{{ credentials.token_generation_time|date:"Y-m-d H:i:s" }} UTC</span>
+                    {% else %}
+                        <span class="text-red-500 font-semibold">Token Missing/Expired!</span>
+                    {% endif %}
+                </div>
+                <form method="post">
+                    {% csrf_token %}
+                    <button type="submit" name="generate_token" class="px-3 py-1 bg-green-500 text-white text-sm font-semibold rounded-lg hover:bg-green-600 transition duration-150 shadow-md">
+                        Generate/Refresh Token (Daily Auth)
+                    </button>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="card p-6 mb-8">
+        <h2 class="text-xl font-semibold mb-4 text-gray-700">Strategy Settings & Manual Control</h2>
+
+        <form method="post" class="space-y-4" onsubmit="return confirm('Are you sure you want to update the strategy settings? This will immediately affect the Algo Engine.');">
+            {% csrf_token %}
+            <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-4">
+                {% for field in strategy_form %}
+                    <div class="flex flex-col">
+                        <label for="{{ field.id_for_label }}" class="mb-1 text-sm font-medium text-gray-600">{{ field.label }}</label>
+                        {% if field.field.widget.input_type == 'checkbox' %}
+                            <div class="flex items-center space-x-2">
+                                {{ field }}
+                                <span class="text-gray-700 text-sm">{{ field.help_text|default:'' }}</span>
+                            </div>
+                        {% else %}
+                            {{ field }}
+                        {% endif %}
+                        {% if field.errors %}<p class="text-red-500 text-xs mt-1">{{ field.errors|striptags }}</p>{% endif %}
+                    </div>
+                {% endfor %}
+            </div>
+            <button type="submit" name="update_strategy" class="px-6 py-2 bg-purple-600 text-white font-semibold rounded-lg hover:bg-purple-700 transition duration-150 shadow-md">
+                Update Strategy Settings
+            </button>
+        </form>
+    </div>
+
+    <!-- Live Trade Monitoring -->
+    <div class="card p-6">
+        <h2 class="text-xl font-semibold mb-4 text-gray-700">Live Trades & Control (Cash Segment)</h2>
+
+        {% if live_trades %}
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Strategy</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Symbol</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Qty</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Entry Price</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Dhan ID</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        {% for trade in live_trades %}
+                        <tr class="hover:bg-gray-50">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ trade.strategy.name }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ trade.symbol }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ trade.quantity }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ trade.entry_price|default:"--" }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                    {% if trade.status == 'OPEN' %}bg-blue-100 text-blue-800
+                                    {% elif trade.status == 'PENDING' %}bg-yellow-100 text-yellow-800
+                                    {% else %}bg-gray-100 text-gray-800{% endif %}">
+                                    {{ trade.status }}
+                                </span>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-500">{{ trade.dhan_order_id|default:"N/A" }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                <form method="post" action="{% url 'dashboard' %}">
+                                    {% csrf_token %}
+                                    <!-- In a real app, this button would trigger a view function to place an order -->
+                                    <button type="submit" name="manual_close_{{ trade.id }}" class="text-red-600 hover:text-red-900 transition duration-150 disabled:opacity-50"
+                                        {% if trade.status != 'OPEN' %}disabled{% endif %} onclick="return confirm('Confirm manual square off for {{ trade.symbol }}?');">
+                                        Square Off
+                                    </button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% else %}
+            <p class="text-gray-500">No open or pending trades found.</p>
+        {% endif %}
+    </div>
+
+    <!-- Explanation of Architecture -->
+    <div class="mt-8 p-6 bg-gray-100 rounded-lg text-sm text-gray-700">
+        <h3 class="font-bold text-lg mb-2">Architecture Note</h3>
+        <p>This application follows a multi-dyno architecture to ensure low latency: </p>
+        <ul class="list-disc list-inside ml-4 mt-2 space-y-1">
+            <li><strong>Web Dyno (Django):</strong> Serves this dashboard and handles configuration persistence (using the database/Firestore).</li>
+            <li><strong>Worker Dyno (<code>data_engine.py</code>):</strong> A dedicated, long-running process that maintains the low-latency Dhan WebSocket connection and publishes tick data to Redis.</li>
+            <li><strong>Algo Dyno (<code>algo_engine.py</code>):</strong> Another dedicated process that subscribes to Redis for market data and control signals, executes trading logic, and uses the Dhan REST API for orders.</li>
+            <li><strong>Redis:</strong> The ultra-fast intermediary for publishing market data and distributing control/status messages.</li>
+        </ul>
+        <p class="mt-2">The credentials and settings you enter above are saved to the database, which the Data and Algo Engines load upon startup or signal refresh.</p>
+    </div>
+
+</body>
+</html>
