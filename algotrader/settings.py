@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 import pytz
+import dj_database_url # <--- NEW IMPORT
 
 # --- CORE DJANGO CONFIGURATION ---
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,7 +20,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'dashboard', # Our main application
+    'dashboard',
 ]
 
 MIDDLEWARE = [
@@ -37,7 +38,7 @@ ROOT_URLCONF = 'algotrader.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates'], # Added for general templates
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -52,12 +53,22 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'algotrader.wsgi.application'
 
+
+# --- DATABASE CONFIGURATION (FIX) ---
+# Default to SQLite for local development
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
+
+# Overwrite DATABASE settings for Heroku using the environment variable
+DB_FROM_ENV = dj_database_url.config(conn_max_age=600)
+if DB_FROM_ENV:
+    DATABASES['default'] = DB_FROM_ENV
+# ------------------------------------
+
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',},
@@ -74,8 +85,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # --- STATIC FILES CONFIGURATION (FIX FOR HEROKU) ---
 STATIC_URL = '/static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles' # <--- THIS LINE IS THE FIX
-#STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage' # Optional for better serving
+STATIC_ROOT = BASE_DIR / 'staticfiles' 
 
 # --- TIMEZONE ---
 IST = pytz.timezone("Asia/Kolkata")
