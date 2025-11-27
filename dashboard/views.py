@@ -59,53 +59,95 @@ def get_dhan_rest_client(client_id: str, access_token: str) -> Optional[object]:
         return None
 
 # --- Core Token Exchange Logic ---
-
 def exchange_token_id_for_access_token(client_id: str, token_id: str) -> Optional[str]:
     """
-    Simulates the REST API call to exchange the temporary tokenId for the 
-    permanent access_token, using the client_id and API_SECRET.
-    
-    NOTE: Dhan's actual API URL for token exchange is used here for concept.
+    Correct Dhan Token Exchange (2025 working method)
     """
-    api_secret = settings.DHAN_API_SECRET
-    
-    if not api_secret:
-        logger.error("DHAN_API_SECRET not set in environment variables. Cannot exchange token.")
+    if not client_id or not token_id:
+        logger.error("Missing client_id or token_id for Dhan token exchange")
         return None
 
-    # This is the actual endpoint for token generation in Dhan's flow
-    TOKEN_EXCHANGE_URL = "https://api.dhan.co/access_token"
-    
+    TOKEN_EXCHANGE_URL = "https://api.dhan.co/v2/token"   # ← YEHI SAHI HAI
+
     headers = {
         'Content-Type': 'application/json',
+        'Accept': 'application/json'
     }
+
     payload = {
-        'grant_type': 'authorization_code',
-        'client_id': client_id,
-        'client_secret': api_secret,
-        'token_id': token_id, 
-        # Note: Some brokers might require 'redirect_uri' even here
+        "clientId": client_id,
+        "tokenId": token_id
     }
-    
+
     try:
-        response = requests.post(TOKEN_EXCHANGE_URL, headers=headers, json=payload)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
+        response = requests.post(TOKEN_EXCHANGE_URL, headers=headers, json=payload, timeout=15)
         
-        # Check if the API returned the token structure successfully
-        if 'access_token' in data and data.get('status') == 'success':
-            logger.info("Successfully exchanged Token ID for Access Token.")
-            return data['access_token']
-        elif 'message' in data:
-            logger.error(f"Dhan API Exchange Failed: {data.get('message')}")
-            return None
+        if response.status_code == 200:
+            data = response.json()
+            access_token = data.get('accessToken')  # ← Note: "accessToken", not "access_token"
+            if access_token:
+                logger.info("Dhan Access Token successfully generated!")
+                return access_token
+            else:
+                logger.error(f"Dhan token response missing accessToken: {data}")
+                return None
         else:
-            logger.error(f"Dhan API Exchange Failed with unexpected response: {data}")
+            error_msg = response.text
+            logger.error(f"Dhan token exchange failed: {response.status_code} {error_msg}")
             return None
 
     except requests.exceptions.RequestException as e:
-        logger.critical(f"Token Exchange REST Call Failed: {e}")
+        logger.critical(f"Network error during Dhan token exchange: {e}")
         return None
+    except Exception as e:
+        logger.critical(f"Unexpected error in token exchange: {e}")
+        return None
+# def exchange_token_id_for_access_token(client_id: str, token_id: str) -> Optional[str]:
+#     """
+#     Simulates the REST API call to exchange the temporary tokenId for the 
+#     permanent access_token, using the client_id and API_SECRET.
+    
+#     NOTE: Dhan's actual API URL for token exchange is used here for concept.
+#     """
+#     api_secret = settings.DHAN_API_SECRET
+    
+#     if not api_secret:
+#         logger.error("DHAN_API_SECRET not set in environment variables. Cannot exchange token.")
+#         return None
+
+#     # This is the actual endpoint for token generation in Dhan's flow
+#     TOKEN_EXCHANGE_URL = "https://api.dhan.co/access_token"
+    
+#     headers = {
+#         'Content-Type': 'application/json',
+#     }
+#     payload = {
+#         'grant_type': 'authorization_code',
+#         'client_id': client_id,
+#         'client_secret': api_secret,
+#         'token_id': token_id, 
+#         # Note: Some brokers might require 'redirect_uri' even here
+#     }
+    
+#     try:
+#         response = requests.post(TOKEN_EXCHANGE_URL, headers=headers, json=payload)
+#         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+#         data = response.json()
+        
+#         # Check if the API returned the token structure successfully
+#         if 'access_token' in data and data.get('status') == 'success':
+#             logger.info("Successfully exchanged Token ID for Access Token.")
+#             return data['access_token']
+#         elif 'message' in data:
+#             logger.error(f"Dhan API Exchange Failed: {data.get('message')}")
+#             return None
+#         else:
+#             logger.error(f"Dhan API Exchange Failed with unexpected response: {data}")
+#             return None
+
+#     except requests.exceptions.RequestException as e:
+#         logger.critical(f"Token Exchange REST Call Failed: {e}")
+#         return None
 
 # --- Django Views ---
 
