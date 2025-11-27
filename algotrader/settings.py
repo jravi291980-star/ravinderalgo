@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import dj_database_url # For configuring PostgreSQL connection
 
@@ -43,7 +43,7 @@ ROOT_URLCONF = 'algotrader.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates'],
+        'DIRS': [BASE_DIR / 'templates'], 
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -68,7 +68,7 @@ DATABASES = {
     }
 }
 
-# Overwrite default settings using the DATABASE_URL environment variable
+# Overwrite default settings using the DATABASE_URL environment variable 
 # provided by Heroku PostgreSQL addon.
 DB_FROM_ENV = dj_database_url.config(conn_max_age=600)
 if DB_FROM_ENV:
@@ -98,7 +98,11 @@ STATIC_ROOT = BASE_DIR / 'staticfiles' # <-- REQUIRED for 'collectstatic' in pro
 IST = pytz.timezone("Asia/Kolkata")
 
 
+# -------------------------------------------------------------------
 # --- REDIS CONFIGURATION AND CHANNELS (LOW-LATENCY BUS) ---
+# -------------------------------------------------------------------
+
+# REDIS_URL environment variable is set by Heroku Redis Addon
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 
 # Channels for Pub/Sub communication
@@ -111,13 +115,19 @@ REDIS_AUTH_CHANNEL = 'auth_channel'          # Token refresh signals
 # Status Keys and Mappings
 REDIS_STATUS_DATA_ENGINE = 'data_engine_status'
 REDIS_STATUS_ALGO_ENGINE = 'algo_engine_status'
-REDIS_DHAN_TOKEN_KEY = 'dhan_access_token'
+REDIS_DHAN_TOKEN_KEY = 'dhan_access_token'   # Key where live token is stored
 PREV_DAY_HASH = 'prev_day_ohlc'             # T-1 High/Low/Close data
 LIVE_OHLC_KEY = 'live_ohlc_data'            # Current LTP snapshot for monitoring
 SYMBOL_ID_MAP_KEY = 'dhan_instrument_map'   # Symbol to Security ID mapping
 
-# --- DHAN API CONFIGURATION KEYS ---
-DHAN_CLIENT_ID = os.environ.get('DHAN_CLIENT_ID')
+# -------------------------------------------------------------------
+# --- DHAN API & STRATEGY CONSTANTS ---
+# -------------------------------------------------------------------
+
+# DHAN API & AUTH KEYS (MUST BE SET VIA HEROKU CONFIG VARS)
+DHAN_CLIENT_ID = os.environ.get('1101693020')
+DHAN_API_SECRET = os.environ.get('9a315e1e-6c1e-4ad0-b6c5-9d2282fb2502') # Needed for programmatic token exchange
+DHAN_REDIRECT_URI = os.environ.get('https://your-dhan-algo-name-9c4491b34a03.herokuapp.com/dhan-callback/') # e.g., https://your-app.herokuapp.com/dhan-callback/
 
 # --- STRATEGY CONSTANTS (used by algo_engine.py) ---
 RISK_MULTIPLIER = 2.5

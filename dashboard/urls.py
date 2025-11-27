@@ -3,5 +3,6 @@ from . import views
 
 urlpatterns = [
     path('', views.dashboard_view, name='dashboard'),
-    # You would add more paths here for manual trade actions (e.g., /manual_square_off)
+    # New dedicated path to handle the redirect from Dhan's authentication flow
+    path('dhan-callback/', views.dhan_callback_view, name='dhan_callback'), 
 ]

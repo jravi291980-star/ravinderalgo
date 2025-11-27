@@ -1,4 +1,3 @@
-```html
 {% load static %}
 <!DOCTYPE html>
 <html lang="en">
@@ -7,89 +6,92 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dhan Algo Dashboard - {{ strategy_form.instance.name }}</title>
     <!-- Load Tailwind CSS -->
-    <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
         /* Custom styles for aesthetic enhancements */
         body {
             font-family: 'Inter', sans-serif;
-            background-color: #f7f7f9;
+            background-color: #f8fafc;
         }
         .card {
             background-color: white;
             border-radius: 12px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
-            border: 1px solid #e5e7eb;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e2e8f0;
+            transition: transform 0.2s;
+        }
+        .card:hover {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
         }
         .status-pill {
-            padding: 4px 10px;
+            padding: 4px 12px;
             border-radius: 9999px;
             font-weight: 600;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
+            text-transform: uppercase;
         }
-        .status-running {
-            background-color: #d1fae5;
-            color: #065f46;
-        }
-        .status-down, .status-error {
-            background-color: #fee2e2;
-            color: #991b1b;
-        }
-        .status-na {
-            background-color: #f3f4f6;
-            color: #4b5563;
+        .status-running { background-color: #d1fae5; color: #065f46; }
+        .status-down, .status-error { background-color: #fee2e2; color: #991b1b; }
+        .status-na { background-color: #e5e7eb; color: #4b5563; }
+        input[type="text"], input[type="number"], input[type="time"] {
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            padding: 8px;
+            width: 100%;
         }
     </style>
 </head>
 <body class="min-h-screen p-4 md:p-8">
     <div class="max-w-7xl mx-auto">
+        
         <!-- Header -->
         <header class="mb-8">
-            <h1 class="text-3xl font-bold text-gray-800">Dhan Algo Trading Dashboard</h1>
+            <h1 class="text-3xl font-extrabold text-gray-900">Dhan Algo Trading Dashboard</h1>
             <p class="text-gray-500">System control panel for the low-latency cash breakout strategy.</p>
         </header>
 
         <!-- Messages -->
         {% if messages %}
-            <div class="mb-4">
+            <div class="mb-6 space-y-2">
                 {% for message in messages %}
-                    <div class="p-3 mb-2 rounded-lg text-sm {% if message.tags == 'success' %}bg-green-100 text-green-800{% elif message.tags == 'error' %}bg-red-100 text-red-800{% else %}bg-blue-100 text-blue-800{% endif %}">
+                    <div class="p-4 rounded-xl text-sm font-medium {% if message.tags == 'success' %}bg-green-100 text-green-800{% elif message.tags == 'error' %}bg-red-100 text-red-800{% else %}bg-blue-100 text-blue-800{% endif %} shadow-md">
                         {{ message }}
                     </div>
                 {% endfor %}
             </div>
         {% endif %}
 
-        <!-- System Health and Controls Grid -->
+        <!-- System Health and Auth Grid -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
 
             <!-- 1. System Health Status -->
-            <div class="card p-5 lg:col-span-2">
-                <h2 class="text-xl font-semibold mb-4 text-gray-700">System Health Overview</h2>
-                <div class="space-y-3">
-                    <div class="flex justify-between items-center border-b pb-2">
-                        <span class="text-gray-600">Web Dyno (Dashboard)</span>
-                        <span class="status-pill status-running">Running</span>
+            <div class="card p-6 lg:col-span-2">
+                <h2 class="text-xl font-bold mb-5 text-gray-700">Worker Health Status (Redis)</h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="p-3 border rounded-lg bg-gray-50">
+                        <span class="text-sm font-semibold text-gray-600 block mb-1">Web Dyno</span>
+                        <span class="status-pill status-running">LIVE</span>
                     </div>
-                    <div class="flex justify-between items-center border-b pb-2">
-                        <span class="text-gray-600">Data Engine (Worker)</span>
+                    <div class="p-3 border rounded-lg bg-gray-50">
+                        <span class="text-sm font-semibold text-gray-600 block mb-1">Data Engine (Worker)</span>
                         {% if data_engine_status == 'RUNNING' %}
                             <span class="status-pill status-running">RUNNING</span>
                         {% elif data_engine_status == 'STARTING' or data_engine_status == 'CONNECTING' %}
-                            <span class="status-pill status-na">STARTING...</span>
+                            <span class="status-pill status-na">CONNECTING...</span>
                         {% elif data_engine_status and 'ERROR' in data_engine_status %}
-                            <span class="status-pill status-error">{{ data_engine_status }}</span>
+                            <span class="status-pill status-error">{{ data_engine_status|truncatechars:15 }}</span>
                         {% else %}
                             <span class="status-pill status-down">DOWN</span>
                         {% endif %}
                     </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-600">Algo Engine (Strategy)</span>
+                    <div class="p-3 border rounded-lg bg-gray-50">
+                        <span class="text-sm font-semibold text-gray-600 block mb-1">Algo Engine (Strategy)</span>
                         {% if algo_engine_status == 'RUNNING' %}
                             <span class="status-pill status-running">RUNNING</span>
                         {% elif algo_engine_status == 'STARTING' %}
                             <span class="status-pill status-na">STARTING...</span>
                         {% elif algo_engine_status and 'ERROR' in algo_engine_status %}
-                            <span class="status-pill status-error">{{ algo_engine_status }}</span>
+                            <span class="status-pill status-error">{{ algo_engine_status|truncatechars:15 }}</span>
                         {% else %}
                             <span class="status-pill status-down">DOWN</span>
                         {% endif %}
@@ -98,12 +100,12 @@
             </div>
 
             <!-- 2. Dhan Credentials and Token Generation -->
-            <div class="card p-5 lg:col-span-1">
-                <h2 class="text-xl font-semibold mb-4 text-gray-700">Dhan Credentials & Token</h2>
+            <div class="card p-6 lg:col-span-1 space-y-4">
+                <h2 class="text-xl font-bold text-gray-700">Dhan API Authentication</h2>
                 <form method="POST" class="space-y-4">
                     {% csrf_token %}
                     
-                    <!-- Client ID -->
+                    <!-- Client ID Input -->
                     <div class="flex flex-col">
                         <label for="{{ form.client_id.id_for_label }}" class="text-sm font-medium text-gray-600 mb-1">{{ form.client_id.label }}</label>
                         {{ form.client_id }}
@@ -113,78 +115,74 @@
                     <div class="flex flex-col">
                         <label for="{{ form.access_token.id_for_label }}" class="text-sm font-medium text-gray-600 mb-1">{{ form.access_token.label }}</label>
                         {{ form.access_token }}
+                        <p class="text-xs text-gray-500 mt-1">Last refreshed: {{ credentials.token_generation_time|default:"Never" }}</p>
                     </div>
 
-                    <button type="submit" name="update_credentials" class="w-full bg-indigo-500 text-white py-2 px-4 rounded-md hover:bg-indigo-600 transition duration-150">
-                        Save Client ID
+                    <button type="submit" name="update_credentials" class="w-full bg-indigo-500 text-white py-2 px-4 rounded-md hover:bg-indigo-600 transition duration-150 font-semibold">
+                        Save Dhan Client ID
                     </button>
                 </form>
 
-                <div class="border-t border-gray-200 my-4 pt-4">
-                    <form method="POST" class="space-y-4">
-                        {% csrf_token %}
-                        <!-- Authorization Code Input -->
-                        <div class="flex flex-col">
-                            <label for="{{ form.auth_code.id_for_label }}" class="text-sm font-medium text-gray-600 mb-1">{{ form.auth_code.label }}</label>
-                            <!-- Note: auth_code is an extra field defined in the form, accessible via form.auth_code -->
-                            {{ form.auth_code }}
-                            <p class="text-xs text-gray-500 mt-1">{{ form.auth_code.help_text }}</p>
-                        </div>
-                        <button type="submit" name="generate_token" class="w-full bg-green-500 text-white py-2 px-4 rounded-md hover:bg-green-600 transition duration-150">
-                            Generate/Refresh Live Access Token
-                        </button>
-                    </form>
+                <div class="border-t border-gray-200 pt-4">
+                    <!-- Token Generation / Login Button -->
+                    {% if credentials.client_id and credentials.client_id != 'Enter Client ID' %}
+                        <form method="POST" action="{% url 'dhan_callback' %}" class="space-y-4">
+                            {% csrf_token %}
+                            <button type="submit" name="dhan_login" class="w-full bg-green-600 text-white py-3 px-4 rounded-md hover:bg-green-700 transition duration-150 font-extrabold text-sm shadow-lg">
+                                Login & Generate Live Access Token
+                            </button>
+                            <p class="text-xs text-gray-500">
+                                This initiates the external Dhan login process and returns the final Access Token automatically.
+                            </p>
+                        </form>
+                    {% else %}
+                        <p class="text-sm text-red-500 font-medium">Please save a valid Dhan Client ID above to enable login.</p>
+                    {% endif %}
                 </div>
             </div>
         </div>
 
         <!-- Strategy Settings -->
         <div class="card p-6 mb-8">
-            <h2 class="text-xl font-semibold mb-4 text-gray-700">Cash Breakout Strategy Settings</h2>
+            <h2 class="text-2xl font-bold mb-4 text-gray-700">{{ strategy_form.instance.name }} Configuration</h2>
             <form method="POST" class="space-y-6">
                 {% csrf_token %}
                 
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                     
                     <!-- Master Control Switches -->
-                    <div class="p-3 bg-gray-50 rounded-lg shadow-inner">
-                        <label class="text-sm font-semibold text-gray-700 block mb-2">Master Controls</label>
-                        <div class="space-y-2">
-                            <div>
-                                <label class="inline-flex items-center">
-                                    {{ strategy_form.is_enabled }}
-                                    <span class="ml-2 text-sm text-gray-600">{{ strategy_form.is_enabled.label }}</span>
-                                </label>
+                    <div class="p-4 bg-yellow-50 rounded-xl border border-yellow-200 shadow-inner">
+                        <h3 class="font-bold text-lg text-yellow-800 mb-3">Master Controls</h3>
+                        <div class="space-y-3">
+                            <div class="flex items-center">
+                                {{ strategy_form.is_enabled }}
+                                <label class="ml-2 text-base font-semibold text-gray-800 cursor-pointer">{{ strategy_form.is_enabled.label }}</label>
                             </div>
-                            <div>
-                                <label class="inline-flex items-center">
-                                    {{ strategy_form.manual_override }}
-                                    <span class="ml-2 text-sm text-gray-600">{{ strategy_form.manual_override.label }}</span>
-                                </label>
-                                <p class="text-xs text-red-500">Disables all automated entries!</p>
+                            <div class="flex items-center">
+                                {{ strategy_form.manual_override }}
+                                <label class="ml-2 text-base font-semibold text-red-600 cursor-pointer">{{ strategy_form.manual_override.label }}</label>
                             </div>
                         </div>
+                        <p class="text-xs text-red-500 mt-2">Manual override immediately stops all *new* automatic trades.</p>
                     </div>
 
                     <!-- Risk/Trade Size Parameters -->
                     <div>
-                        <h3 class="font-medium text-gray-600 mb-2 border-b pb-1">Risk Parameters</h3>
+                        <h3 class="font-medium text-gray-700 mb-3 border-b pb-1">Risk Parameters</h3>
                         {% for field in strategy_form %}
                             {% if field.name == 'per_trade_sl_amount' %}
-                                <div class="mb-3">
-                                    <label for="{{ field.id_for_label }}" class="text-sm text-gray-600 block">{{ field.label }}</label>
+                                <div class="mb-4">
+                                    <label for="{{ field.id_for_label }}" class="text-sm font-medium text-gray-600 block">{{ field.label }}</label>
                                     {{ field }}
-                                    {% if field.errors %}<p class="text-red-500 text-xs mt-1">{{ field.errors }}</p>{% endif %}
                                 </div>
                             {% endif %}
                         {% endfor %}
-                        <h3 class="font-medium text-gray-600 mb-2 border-b pb-1">Limit Parameters</h3>
+                        <h3 class="font-medium text-gray-700 mb-3 border-b pb-1">Limit Parameters</h3>
                         {% for field in strategy_form %}
                             {% if field.name == 'max_total_trades' or field.name == 'max_trades_per_stock' %}
-                                <div class="mb-3">
-                                    <label for="{{ field.id_for_label }}" class="text-sm text-gray-600 block">{{ field.label }}</label>
+                                <div class="mb-4">
+                                    <label for="{{ field.id_for_label }}" class="text-sm font-medium text-gray-600 block">{{ field.label }}</label>
                                     {{ field }}
-                                    {% if field.errors %}<p class="text-red-500 text-xs mt-1">{{ field.errors }}</p>{% endif %}
                                 </div>
                             {% endif %}
                         {% endfor %}
@@ -192,13 +190,12 @@
                     
                     <!-- Breakout/Entry Filters -->
                     <div>
-                        <h3 class="font-medium text-gray-600 mb-2 border-b pb-1">Breakout Filters</h3>
+                        <h3 class="font-medium text-gray-700 mb-3 border-b pb-1">Entry/Candle Filters</h3>
                         {% for field in strategy_form %}
                             {% if field.name == 'entry_offset_pct' or field.name == 'stop_offset_pct' or field.name == 'max_candle_pct' %}
-                                <div class="mb-3">
-                                    <label for="{{ field.id_for_label }}" class="text-sm text-gray-600 block">{{ field.label }}</label>
+                                <div class="mb-4">
+                                    <label for="{{ field.id_for_label }}" class="text-sm font-medium text-gray-600 block">{{ field.label }}</label>
                                     {{ field }}
-                                    {% if field.errors %}<p class="text-red-500 text-xs mt-1">{{ field.errors }}</p>{% endif %}
                                 </div>
                             {% endif %}
                         {% endfor %}
@@ -206,19 +203,16 @@
                     
                     <!-- P&L and Time Exits -->
                     <div>
-                        <h3 class="font-medium text-gray-600 mb-2 border-b pb-1">Time & P&L Exits</h3>
-                        <div class="mb-3">
-                            <label class="inline-flex items-center">
-                                {{ strategy_form.pnl_exit_enabled }}
-                                <span class="ml-2 text-sm text-gray-600">{{ strategy_form.pnl_exit_enabled.label }}</span>
-                            </label>
+                        <h3 class="font-medium text-gray-700 mb-3 border-b pb-1">Time & P&L Exits</h3>
+                        <div class="mb-4 flex items-center">
+                            {{ strategy_form.pnl_exit_enabled }}
+                            <label class="ml-2 text-base font-medium text-gray-600 cursor-pointer">{{ strategy_form.pnl_exit_enabled.label }}</label>
                         </div>
                         {% for field in strategy_form %}
                             {% if field.name == 'pnl_profit_target' or field.name == 'pnl_stop_loss' or field.name == 'start_time' or field.name == 'end_time' %}
-                                <div class="mb-3">
-                                    <label for="{{ field.id_for_label }}" class="text-sm text-gray-600 block">{{ field.label }}</label>
+                                <div class="mb-4">
+                                    <label for="{{ field.id_for_label }}" class="text-sm font-medium text-gray-600 block">{{ field.label }}</label>
                                     {{ field }}
-                                    {% if field.errors %}<p class="text-red-500 text-xs mt-1">{{ field.errors }}</p>{% endif %}
                                 </div>
                             {% endif %}
                         {% endfor %}
@@ -229,8 +223,8 @@
                 {{ strategy_form.name }}
                 {{ strategy_form.strategy_type }}
 
-                <button type="submit" name="update_strategy" class="mt-4 bg-blue-500 text-white py-2 px-6 rounded-md hover:bg-blue-600 transition duration-150">
-                    Save All Strategy Settings
+                <button type="submit" name="update_strategy" class="mt-4 bg-blue-600 text-white py-3 px-8 rounded-lg hover:bg-blue-700 transition duration-150 font-extrabold shadow-lg">
+                    Save Strategy Configuration
                 </button>
             </form>
         </div>
@@ -238,29 +232,29 @@
 
         <!-- Live Trades Monitoring -->
         <div class="card p-6">
-            <h2 class="text-xl font-semibold mb-4 text-gray-700">Live Trades & Positions ({{ live_trades|length }})</h2>
+            <h2 class="text-2xl font-bold mb-4 text-gray-700">Live Trades & Positions ({{ live_trades|length }})</h2>
             
             <div class="overflow-x-auto">
                 <table class="min-w-full divide-y divide-gray-200">
-                    <thead class="bg-gray-50">
+                    <thead class="bg-gray-100">
                         <tr>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Symbol / ID</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Qty</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Entry/SL/Target</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Signal Time</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Symbol</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Qty</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Entry/SL/Target</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Signal Time</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Action</th>
                         </tr>
                     </thead>
-                    <tbody class="bg-white divide-y divide-gray-200">
+                    <tbody class="bg-white divide-y divide-gray-100">
                         {% for trade in live_trades %}
                         <tr>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                                {{ trade.symbol }} ({{ trade.security_id }})
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900">
+                                {{ trade.symbol }}
                             </td>
                             <td class="px-6 py-4 whitespace-nowrap">
                                 {% if trade.status == 'OPEN' %}
-                                    <span class="status-pill bg-blue-100 text-blue-800">OPEN</span>
+                                    <span class="status-pill bg-green-100 text-green-800">OPEN</span>
                                 {% elif trade.status == 'PENDING_ENTRY' %}
                                     <span class="status-pill bg-yellow-100 text-yellow-800">PENDING ENTRY</span>
                                 {% elif trade.status == 'PENDING_EXIT' %}
@@ -272,8 +266,8 @@
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
                                 {{ trade.quantity }}
                             </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
-                                E: {{ trade.entry_price|default:trade.entry_level|floatformat:2 }}<br>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-700 tabular-nums">
+                                E: <span class="font-medium">{{ trade.entry_price|default:trade.entry_level|floatformat:2 }}</span><br>
                                 SL: {{ trade.stop_level|floatformat:2 }}<br>
                                 T: {{ trade.target_level|floatformat:2 }}
                             </td>
@@ -285,8 +279,16 @@
                                     <form method="POST" action="{% url 'dashboard' %}" class="inline">
                                         {% csrf_token %}
                                         <input type="hidden" name="trade_id" value="{{ trade.id }}">
-                                        <button type="submit" name="manual_square_off" class="text-red-600 hover:text-red-900 transition duration-150 text-xs font-semibold px-2 py-1 border border-red-300 rounded-md">
-                                            Manual Square Off
+                                        <button type="submit" name="manual_square_off" class="text-red-600 hover:text-red-900 transition duration-150 text-xs font-semibold px-3 py-1 border border-red-300 rounded-lg shadow-sm bg-red-50">
+                                            Square Off
+                                        </button>
+                                    </form>
+                                {% elif trade.status == 'PENDING_ENTRY' %}
+                                    <form method="POST" action="{% url 'dashboard' %}" class="inline">
+                                        {% csrf_token %}
+                                        <input type="hidden" name="trade_id" value="{{ trade.id }}">
+                                        <button type="submit" name="manual_cancel_entry" class="text-yellow-600 hover:text-yellow-800 transition duration-150 text-xs font-semibold px-3 py-1 border border-yellow-300 rounded-lg shadow-sm bg-yellow-50">
+                                            Cancel Entry
                                         </button>
                                     </form>
                                 {% else %}
@@ -296,7 +298,9 @@
                         </tr>
                         {% empty %}
                         <tr>
-                            <td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No active or pending trades found.</td>
+                            <td colspan="6" class="px-6 py-8 text-center text-base text-gray-500 bg-gray-50 rounded-b-xl">
+                                System is currently flat. Waiting for market data and signals.
+                            </td>
                         </tr>
                         {% endfor %}
                     </tbody>
