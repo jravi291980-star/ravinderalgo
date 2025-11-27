@@ -6,14 +6,8 @@ from datetime import datetime
 import redis
 import json
 import time
-import requests # Needed for REST API calls
-# FIX: Import the core client function, dhanhq, and DhanContext via the top level
-# Note: If this import fails, the library structure is highly inconsistent.
-try:
-    from dhanhq import DhanContext, dhanhq
-except ImportError:
-    # Fallback import structure if the direct import fails (common in older versions)
-    from dhanhq.dhanhq import DhanContext, dhanhq 
+import requests
+from typing import Optional # Used for type hinting
 
 # --- FIX: Using CashBreakoutTrade model instead of LiveTrade ---
 from .models import DhanCredentials, StrategySettings, CashBreakoutTrade 
@@ -21,28 +15,40 @@ from .forms import DhanCredentialsForm, StrategySettingsForm
 
 # Initialize Redis connection (read-only for dashboard status)
 try:
-    # CRITICAL FIX: Add ssl_cert_reqs=None and decode_responses=True for Heroku Redis SSL connection
+    # CRITICAL FIX: Add ssl_cert_reqs=None for Heroku Redis SSL connection
     r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-    # Ping to test connection immediately (this is where the previous error occurred)
     r.ping()
 except Exception as e:
     print(f"REDIS CONNECTION ERROR (Dashboard): {e}")
     r = None 
 
-# --- Global Helper for Dhan Client Initialization ---
-def get_dhan_rest_client(client_id, access_token):
-    """Initializes and returns the Dhan REST client."""
+# --- Global Helper for Dhan Client Initialization (LAZY IMPORT + FALLBACK) ---
+def get_dhan_rest_client(client_id: str, access_token: str) -> Optional[object]:
+    """
+    Initializes and returns the Dhan REST client using the most compatible
+    DhanHQ SDK pattern, or returns None if the SDK fails to load/initialize.
+    """
+    dhan = None
     try:
-        # We assume DhanContext and dhanhq are now globally accessible or handled by the try/except block above
+        # A. RECOMMENDED: Try the current v2.1+ context-based pattern
+        from dhanhq import DhanContext, dhanhq 
         dhan_context = DhanContext(client_id, access_token) 
-        # dhanhq() function is used to instantiate the client
-        return dhanhq(dhan_context) 
-    except NameError:
-        print("DhanContext or dhanhq class/function not initialized due to ImportError.")
-        return None
+        dhan = dhanhq(dhan_context) 
+        print("Dhan Client Initialized using DhanContext (v2.1+).")
+    except ImportError:
+        try:
+            # B. FALLBACK: Try the older v1 direct instantiation pattern
+            from dhanhq import dhanhq as dhanfactory
+            dhan = dhanfactory(client_id, access_token)
+            print("Dhan Client Initialized using old direct method (v1 fallback).")
+        except Exception as e:
+            print(f"Dhan Client Initialization FAILED (Import or API error): {e}")
+            dhan = None
     except Exception as e:
-        print(f"Dhan Client Initialization Failed: {e}")
-        return None
+        print(f"Dhan Client Initialization FAILED (v2 Context Error): {e}")
+        dhan = None
+        
+    return dhan
 
 
 def dashboard_view(request):
@@ -55,27 +61,22 @@ def dashboard_view(request):
             defaults={
                 'is_enabled': False,
                 'name': 'Cash Breakout Strategy',
-                # Populate other necessary fields based on defaults in models.py
             }
         )
     except Exception as e:
         # If this fails, it is highly likely the database migration failed.
         print(f"DATABASE ERROR during StrategySettings lookup: {e}")
-        # Note: HEROKU_APP_NAME is not globally set in settings, fetch if needed for message
-        messages.error(request, f"Database table initialization failed. Run migrations.")
-        strategy = None # Prevents further DB interaction if models fail to load
+        messages.error(request, f"Critical Database Error: Tables not found. Run migrations.")
+        strategy = None 
 
     if not strategy:
-        # Render a simple error page if strategy object could not be retrieved
         return render(request, 'dashboard/index.html', {'error_message': 'Critical Database Error: Tables not found.'})
 
 
     # 2. Handle Credentials Management
     try:
-        # Attempt to get the existing single credentials object
         credentials = DhanCredentials.objects.get(is_active=True)
     except DhanCredentials.DoesNotExist:
-        # Create a new placeholder if none exists
         credentials = DhanCredentials(client_id=settings.DHAN_CLIENT_ID or 'Enter Client ID')
 
     if request.method == 'POST' and 'update_credentials' in request.POST:
@@ -111,7 +112,7 @@ def dashboard_view(request):
         strategy_form = StrategySettingsForm(instance=strategy)
 
 
-    # 4. Token Generation Logic (Integration with placeholder for API call)
+    # 4. Token Generation Logic (Integration Placeholder)
     if request.method == 'POST' and 'generate_token' in request.POST and credentials.client_id:
         
         client_id = credentials.client_id
@@ -120,9 +121,12 @@ def dashboard_view(request):
             return redirect('dashboard')
 
         # --- DHAN API INTEGRATION PLACEHOLDER ---
+        # NOTE: For a live app, this section would involve an API call to exchange 
+        # an authorization code for the actual access token.
+        
+        # MOCK API CALL SUCCESS (TEMPORARY TOKEN FOR TESTING WORKER STARTUP)
         new_token = f"DHAN_MOCK_TOKEN_{int(time.time())}_{client_id}" 
-
-        # --- MOCK API CALL SUCCESS ---
+        
         credentials.access_token = new_token
         credentials.token_generation_time = timezone.now()
         credentials.save()
