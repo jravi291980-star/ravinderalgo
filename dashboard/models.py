@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from django.conf import settings  # Needed for accessing constants like IST
+import pytz # <-- CORRECTED IMPORT: pytz must be imported directly
 
 # Ensure IST timezone is available
 IST = timezone.pytz.timezone("Asia/Kolkata")
