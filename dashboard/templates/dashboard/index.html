@@ -99,7 +99,7 @@
                 </div>
             </div>
 
-            <!-- 2. Dhan Credentials and Token Generation -->
+            <!-- 2. Dhan Credentials and Token Generation (Manual Paste) -->
             <div class="card p-6 lg:col-span-1 space-y-4">
                 <h2 class="text-xl font-bold text-gray-700">Dhan API Authentication</h2>
                 <form method="POST" class="space-y-4">
@@ -111,6 +111,13 @@
                         {{ form.client_id }}
                     </div>
 
+                    <!-- Manual Access Token Paste Field -->
+                    <div class="flex flex-col">
+                        <label for="{{ form.manual_access_token.id_for_label }}" class="text-sm font-medium text-gray-600 mb-1">{{ form.manual_access_token.label }}</label>
+                        {{ form.manual_access_token }}
+                        <p class="text-xs text-gray-500 mt-1">{{ form.manual_access_token.help_text }}</p>
+                    </div>
+
                     <!-- Current Access Token (Read Only) -->
                     <div class="flex flex-col">
                         <label for="{{ form.access_token.id_for_label }}" class="text-sm font-medium text-gray-600 mb-1">{{ form.access_token.label }}</label>
@@ -118,27 +125,15 @@
                         <p class="text-xs text-gray-500 mt-1">Last refreshed: {{ credentials.token_generation_time|default:"Never" }}</p>
                     </div>
 
-                    <button type="submit" name="update_credentials" class="w-full bg-indigo-500 text-white py-2 px-4 rounded-md hover:bg-indigo-600 transition duration-150 font-semibold">
-                        Save Dhan Client ID
-                    </button>
+                    <div class="grid grid-cols-2 gap-4">
+                        <button type="submit" name="update_credentials" class="w-full bg-indigo-500 text-white py-2 px-4 rounded-md hover:bg-indigo-600 transition duration-150 font-semibold">
+                            Save Client ID
+                        </button>
+                        <button type="submit" name="activate_token" class="w-full bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 transition duration-150 font-extrabold shadow-lg">
+                            Activate Trading Session
+                        </button>
+                    </div>
                 </form>
-
-                <div class="border-t border-gray-200 pt-4">
-                    <!-- Token Generation / Login Button -->
-                    {% if credentials.client_id and credentials.client_id != 'Enter Client ID' %}
-                        <form method="POST" action="{% url 'dhan_callback' %}" class="space-y-4">
-                            {% csrf_token %}
-                            <button type="submit" name="dhan_login" class="w-full bg-green-600 text-white py-3 px-4 rounded-md hover:bg-green-700 transition duration-150 font-extrabold text-sm shadow-lg">
-                                Login & Generate Live Access Token
-                            </button>
-                            <p class="text-xs text-gray-500">
-                                This initiates the external Dhan login process and returns the final Access Token automatically.
-                            </p>
-                        </form>
-                    {% else %}
-                        <p class="text-sm text-red-500 font-medium">Please save a valid Dhan Client ID above to enable login.</p>
-                    {% endif %}
-                </div>
             </div>
         </div>
 

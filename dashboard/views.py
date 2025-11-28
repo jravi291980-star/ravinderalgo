@@ -1,20 +1,18 @@
 from django.shortcuts import render, redirect
 from django.conf import settings
 from django.contrib import messages
-from django.urls import reverse
 from django.utils import timezone
 from datetime import datetime
 import redis
 import json
 import time
-import requests
-from typing import Optional, Dict, Any
 import logging
+from typing import Optional, Dict, Any
 
 # --- FIX: Robust/Lazy Import of Dhan SDK components ---
 # Import the client function and context conditionally to prevent module-level crashes
 try:
-    from dhanhq import DhanContext, dhanhq, DhanHQ # Attempt to import all necessary classes
+    from dhanhq import DhanContext, dhanhq 
 except ImportError:
     # Define placeholder class/function if import fails early (used by get_dhan_rest_client)
     class DhanContext:
@@ -22,8 +20,7 @@ except ImportError:
             self.client_id = client_id
             self.access_token = access_token
     dhanhq = lambda ctx: None
-    DhanHQ = lambda client_id, access_token: None # Placeholder for older versions
-
+    
 # --- Import Models and Forms ---
 from .models import DhanCredentials, StrategySettings, CashBreakoutTrade 
 from .forms import DhanCredentialsForm, StrategySettingsForm
@@ -58,97 +55,6 @@ def get_dhan_rest_client(client_id: str, access_token: str) -> Optional[object]:
         logger.error(f"Dhan Client Initialization FAILED: {e}")
         return None
 
-# --- Core Token Exchange Logic ---
-def exchange_token_id_for_access_token(client_id: str, token_id: str) -> Optional[str]:
-    """
-    Correct Dhan Token Exchange (2025 working method)
-    """
-    if not client_id or not token_id:
-        logger.error("Missing client_id or token_id for Dhan token exchange")
-        return None
-
-    TOKEN_EXCHANGE_URL = "https://api.dhan.co/v2/token"   # ← YEHI SAHI HAI
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-
-    payload = {
-        "clientId": client_id,
-        "tokenId": token_id
-    }
-
-    try:
-        response = requests.post(TOKEN_EXCHANGE_URL, headers=headers, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            access_token = data.get('accessToken')  # ← Note: "accessToken", not "access_token"
-            if access_token:
-                logger.info("Dhan Access Token successfully generated!")
-                return access_token
-            else:
-                logger.error(f"Dhan token response missing accessToken: {data}")
-                return None
-        else:
-            error_msg = response.text
-            logger.error(f"Dhan token exchange failed: {response.status_code} {error_msg}")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        logger.critical(f"Network error during Dhan token exchange: {e}")
-        return None
-    except Exception as e:
-        logger.critical(f"Unexpected error in token exchange: {e}")
-        return None
-# def exchange_token_id_for_access_token(client_id: str, token_id: str) -> Optional[str]:
-#     """
-#     Simulates the REST API call to exchange the temporary tokenId for the 
-#     permanent access_token, using the client_id and API_SECRET.
-    
-#     NOTE: Dhan's actual API URL for token exchange is used here for concept.
-#     """
-#     api_secret = settings.DHAN_API_SECRET
-    
-#     if not api_secret:
-#         logger.error("DHAN_API_SECRET not set in environment variables. Cannot exchange token.")
-#         return None
-
-#     # This is the actual endpoint for token generation in Dhan's flow
-#     TOKEN_EXCHANGE_URL = "https://api.dhan.co/access_token"
-    
-#     headers = {
-#         'Content-Type': 'application/json',
-#     }
-#     payload = {
-#         'grant_type': 'authorization_code',
-#         'client_id': client_id,
-#         'client_secret': api_secret,
-#         'token_id': token_id, 
-#         # Note: Some brokers might require 'redirect_uri' even here
-#     }
-    
-#     try:
-#         response = requests.post(TOKEN_EXCHANGE_URL, headers=headers, json=payload)
-#         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-#         data = response.json()
-        
-#         # Check if the API returned the token structure successfully
-#         if 'access_token' in data and data.get('status') == 'success':
-#             logger.info("Successfully exchanged Token ID for Access Token.")
-#             return data['access_token']
-#         elif 'message' in data:
-#             logger.error(f"Dhan API Exchange Failed: {data.get('message')}")
-#             return None
-#         else:
-#             logger.error(f"Dhan API Exchange Failed with unexpected response: {data}")
-#             return None
-
-#     except requests.exceptions.RequestException as e:
-#         logger.critical(f"Token Exchange REST Call Failed: {e}")
-#         return None
-
 # --- Django Views ---
 
 def dashboard_view(request):
@@ -175,18 +81,50 @@ def dashboard_view(request):
     except DhanCredentials.DoesNotExist:
         credentials = DhanCredentials(client_id=settings.DHAN_CLIENT_ID or 'Enter Client ID')
 
-    if request.method == 'POST' and 'update_credentials' in request.POST:
+    # Handle POST submission for Credentials OR Token Activation
+    if request.method == 'POST':
         form = DhanCredentialsForm(request.POST, instance=credentials)
-        if form.is_valid():
-            creds = form.save(commit=False)
-            creds.is_active = True
-            creds.save()
-            messages.success(request, "Dhan Client ID updated.")
+        
+        if 'update_credentials' in request.POST:
+            # --- Handler for saving Client ID ---
+            if form.is_valid():
+                creds = form.save(commit=False)
+                creds.is_active = True
+                creds.save()
+                messages.success(request, "Dhan Client ID updated.")
+                return redirect('dashboard')
+            else:
+                messages.error(request, "Error saving credentials.")
+
+        elif 'activate_token' in request.POST:
+            # --- Handler for Manual Token Activation ---
+            manual_token = request.POST.get('manual_access_token')
+            client_id = request.POST.get('client_id')
+            
+            if not manual_token or not client_id:
+                messages.error(request, "Client ID and Access Token must be provided for activation.")
+                return redirect('dashboard')
+            
+            # 1. Save Token to DB
+            credentials.access_token = manual_token.strip()
+            credentials.token_generation_time = timezone.now()
+            credentials.client_id = client_id.strip() # Ensure ID is saved if changed
+            credentials.save()
+            
+            # 2. Distribute Token via Redis
+            if r:
+                r.set(settings.REDIS_DHAN_TOKEN_KEY, credentials.access_token)
+                r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({
+                    'action': 'TOKEN_REFRESH', 
+                    'token': credentials.access_token
+                }))
+                
+            messages.success(request, "Trading session activated! Token distributed to workers.")
             return redirect('dashboard')
-        else:
-            messages.error(request, "Error saving credentials.")
-    else:
+    
+    else: # GET request
         form = DhanCredentialsForm(instance=credentials)
+
 
     # 3. Handle Strategy Settings Update
     if request.method == 'POST' and 'update_strategy' in request.POST:
@@ -202,7 +140,7 @@ def dashboard_view(request):
             return redirect('dashboard')
         else:
             messages.error(request, "Error saving strategy settings.")
-    else:
+    else: # GET request
         strategy_form = StrategySettingsForm(instance=strategy)
 
 
@@ -222,48 +160,5 @@ def dashboard_view(request):
         'live_trades': live_trades,
         'data_engine_status': data_engine_status,
         'algo_engine_status': algo_engine_status,
-        'dhan_auth_url': f"https://api.dhan.co/auth/signin?client_id={credentials.client_id}&redirect_uri={settings.DHAN_REDIRECT_URI}&state={credentials.client_id}",
     }
     return render(request, 'dashboard/index.html', context)
-
-
-def dhan_callback_view(request):
-    """
-    Handles the redirect from the Dhan authorization flow. 
-    Exchanges the temporary tokenId (auth code) for the permanent access_token.
-    """
-    global r
-    if r is None: r = initialize_redis()
-
-    token_id = request.GET.get('tokenId')
-    client_id = request.GET.get('client_id') # Dhan often returns the client_id/state
-    
-    if not token_id:
-        messages.error(request, "Dhan login failed or did not return a tokenId (authorization code).")
-        return redirect('dashboard')
-
-    try:
-        credentials = DhanCredentials.objects.get(client_id=client_id, is_active=True)
-    except DhanCredentials.DoesNotExist:
-        messages.error(request, f"Client ID {client_id} not found or inactive.")
-        return redirect('dashboard')
-        
-    # --- STEP 1: Exchange tokenId for Access Token (REST API Call) ---
-    new_access_token = exchange_token_id_for_access_token(credentials.client_id, token_id)
-
-    if new_access_token:
-        # --- STEP 2: Save & Distribute Live Token ---
-        credentials.access_token = new_access_token
-        credentials.token_generation_time = timezone.now()
-        credentials.save()
-        
-        # Publish token update to all workers (Data and Algo dynos)
-        if r:
-            r.set(settings.REDIS_DHAN_TOKEN_KEY, new_access_token)
-            r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({'action': 'TOKEN_REFRESH', 'token': new_access_token}))
-        
-        messages.success(request, f"LIVE Access Token acquired and distributed. Ready for trading!")
-    else:
-        messages.error(request, "Failed to exchange Authorization Code (tokenId) for live Access Token. Check API Secret/Dhan logs.")
-
-    return redirect('dashboard')
