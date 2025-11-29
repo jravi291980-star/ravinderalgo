@@ -1,6 +1,7 @@
 # dashboard/management/commands/fetch_prev_day_ohlc.py
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -8,24 +9,30 @@ from django.core.management.base import BaseCommand, CommandError
 from django.conf import settings
 import redis
 
-# --- Robust Dhan SDK Import ---
-try:
-    from dhanhq import DhanContext, dhanhq
-except ImportError:
-    class DhanContext:
-        def __init__(self, client_id, access_token): pass
-    dhanhq = lambda ctx: None
-
-def get_dhan_client(client_id: str, token: str) -> Optional[object]:
-    """Initializes the Dhan REST client robustly."""
-    if not token:
+# --- Global Helper for Dhan Client Initialization (Robust) ---
+def get_dhan_client(client_id: str, access_token: str) -> Optional[object]:
+    """
+    Initializes and returns the Dhan REST client using the most compatible
+    DhanHQ SDK pattern, handling version differences on Heroku.
+    """
+    if not access_token or not client_id:
         return None
+    
     try:
-        from dhanhq import DhanContext, dhanhq
-        dhan_context = DhanContext(client_id, token)
-        dhan = dhanhq(dhan_context)
+        # A. RECOMMENDED: Try the current v2.1+ context-based pattern
+        from dhanhq import DhanContext, dhanhq 
+        dhan_context = DhanContext(client_id, access_token) 
+        dhan = dhanhq(dhan_context) 
         return dhan
-    except Exception as e:
+    except ImportError:
+        try:
+            # B. FALLBACK: Try the older v1 direct instantiation pattern
+            import dhanhq
+            dhan = dhanhq.dhanhq(client_id, access_token)
+            return dhan
+        except Exception:
+            return None
+    except Exception:
         return None
 
 class Command(BaseCommand):
