@@ -55,14 +55,3 @@ class StrategySettingsForm(forms.ModelForm):
             'start_time': forms.TimeInput(format='%H:%M', attrs={'type': 'time'}),
             'end_time': forms.TimeInput(format='%H:%M', attrs={'type': 'time'}),
         }
-
-class InstrumentUploadForm(forms.Form):
-    """
-    Form dedicated to receiving the Dhan Scrip Master CSV file upload.
-    This form does not use a Model as it only handles file input.
-    """
-    instrument_csv = forms.FileField(
-        label="Dhan Scrip Master CSV",
-        help_text="Upload the full scrip master file to map Nifty 500 symbols to required Security IDs.",
-        widget=forms.FileInput(attrs={'accept': '.csv'})
-    )

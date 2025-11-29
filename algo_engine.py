@@ -1,654 +1,524 @@
-# algo_engine.py - Runs on an Algo Dyno on Heroku
+# algo_engine.py - Runs on an Algo Dyno
 import redis
 import json
 import os
 import time
-import threading
-from dhanhq import dhanhq, DhanContext  # Import necessary classes
-from datetime import datetime, timedelta, time as dt_time
-from typing import Dict, Optional, Any, List
+import sys
+from datetime import datetime, timedelta
 from math import floor
-from tenacity import retry, stop_after_attempt, wait_fixed, RetryError
+from typing import Dict, Any, Optional
 
-# --- Django Setup and Imports for Worker ---
-# Note: This is critical for DB access on the worker dyno
-import django
-
+# --- Django Environment Setup ---
+# This allows the standalone script to access Django models and settings
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'algotrader.settings')
+
+import django
+django.setup()
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+from dashboard.models import CashBreakoutTrade, StrategySettings
+
+# --- Robust Dhan SDK Import ---
 try:
-    django.setup()
-    from django.db import transaction, models
-    from django.utils import timezone
-    from django.conf import settings
-    from dashboard.models import CashBreakoutTrade, StrategySettings
+    from dhanhq import DhanContext, dhanhq
+except ImportError:
+    # Fallback placeholders to prevent startup crash if lib has issues
+    # The loop will simply fail to trade if this happens, rather than crashing entirely
+    class DhanContext:
+        def __init__(self, c, t): pass
+    dhanhq = lambda ctx: None
 
-    # Initialize constants from settings
-    REDIS_URL = settings.REDIS_URL
-    REDIS_DATA_CHANNEL = settings.REDIS_DATA_CHANNEL
-    REDIS_ORDER_UPDATE_CHANNEL = settings.REDIS_ORDER_UPDATE_CHANNEL
-    REDIS_CANDLE_CHANNEL = settings.REDIS_CANDLE_CHANNEL
-    REDIS_CONTROL_CHANNEL = settings.REDIS_CONTROL_CHANNEL
-    REDIS_AUTH_CHANNEL = settings.REDIS_AUTH_CHANNEL
-    REDIS_STATUS_ALGO_ENGINE = settings.REDIS_STATUS_ALGO_ENGINE
-    REDIS_DHAN_TOKEN_KEY = settings.REDIS_DHAN_TOKEN_KEY
-    PREV_DAY_HASH = settings.PREV_DAY_HASH
-    LIVE_OHLC_KEY = settings.LIVE_OHLC_KEY
-    RISK_MULTIPLIER = settings.RISK_MULTIPLIER
-    BREAKEVEN_TRIGGER_R = settings.BREAKEVEN_TRIGGER_R
-    MAX_MONITORING_MINUTES = settings.MAX_MONITORING_MINUTES
-    RECONCILIATION_INTERVAL_SECONDS = settings.RECONCILIATION_INTERVAL_SECONDS
+# --- Configuration & Constants ---
+# Using ssl_cert_reqs=None is critical for Heroku Redis connection stability
+r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+IST = settings.IST
 
-    CLIENT_ID = settings.DHAN_CLIENT_ID
-except Exception as e:
-    print(f"CRITICAL: Failed to load Django/Settings: {e}. Exiting.")
-    time.sleep(60)
-    exit()
+# --- Reverse Map Construction ---
+# We invert the settings map {Symbol: ID} -> {ID: Symbol} for fast lookup 
+# when processing incoming ticks (which only have IDs).
+SECURITY_ID_TO_SYMBOL = {str(v): k for k, v in settings.SECURITY_ID_MAP.items()}
 
-# --- Redis & Dhan Client Setup ---
-r = redis.from_url(REDIS_URL, decode_responses=True)
-DHAN_CLIENT: Optional[dhanhq] = None
-IST = timezone.pytz.timezone("Asia/Kolkata")
+# --- Global State ---
+DHAN_CLIENT = None
 
-# Global variables/containers (populated by dhan_workers.py)
-SYMBOL_TO_SECURITY_ID: Dict[str, str] = {}
-SECURITY_ID_TO_SYMBOL: Dict[str, str] = {}
+# --- STREAM SETUP HELPER ---
+def setup_consumer_groups():
+    """Ensures consumer groups exist for all streams."""
+    streams = [settings.REDIS_STREAM_MARKET, settings.REDIS_STREAM_ORDERS, settings.REDIS_STREAM_CONTROL]
+    for stream in streams:
+        try:
+            # Create group starting from the end ($) so we only process new messages on startup
+            # mkstream=True creates the stream if it doesn't exist yet
+            r.xgroup_create(stream, settings.REDIS_CONSUMER_GROUP, id='$', mkstream=True)
+            print(f"Created/Verified consumer group for {stream}")
+        except redis.exceptions.ResponseError as e:
+            # "BUSYGROUP Consumer Group name already exists" is expected and fine
+            if "BUSYGROUP" not in str(e):
+                print(f"Error creating group for {stream}: {e}")
 
-
-# --- Utility Functions (Adapted from old strategy) ---
-
-def get_dhan_client(token):
-    """Initializes and returns the Dhan REST client using DhanContext."""
-    global DHAN_CLIENT
+def get_dhan_client(token: str) -> Optional[object]:
+    """Initializes the Dhan REST client using the token."""
     try:
-        dhan_context = DhanContext(CLIENT_ID, token)
-        DHAN_CLIENT = dhanhq(dhan_context)
-        print(f"[{datetime.now()}] Dhan REST client initialized with new token.")
+        if not token: return None
+        return dhanhq(DhanContext(settings.DHAN_CLIENT_ID, token))
     except Exception as e:
-        print(f"ERROR initializing Dhan client: {e}")
-        DHAN_CLIENT = None
-    return DHAN_CLIENT
-
-
-def _get_prev_day_high(symbol: str) -> Optional[float]:
-    """Return the previous day high for `symbol` from Redis."""
-    try:
-        raw = r.hget(PREV_DAY_HASH, symbol)
-        if not raw:
-            return None
-        # The data is expected to be {'high': 123.45}
-        parsed = json.loads(raw)
-        return float(parsed.get("high")) if parsed.get("high") is not None else None
-    except Exception as e:
-        print(f"ERROR: failed to read prev day high for {symbol}: {e}")
+        print(f"Client Init Error: {e}")
         return None
 
-
-def _calculate_quantity(max_loss_amount: float, entry_price: float, sl_price: float) -> int:
-    """Compute allowed quantity based on max risk amount, mirroring the original logic."""
-    try:
-        max_loss_amount = float(max_loss_amount)
-    except Exception:
-        return 0
-
-    risk_per_share = abs(entry_price - sl_price)
-    if risk_per_share <= 0.001:
-        return 0
-
-    qty = floor(max_loss_amount / risk_per_share)
-    qty = max(0, int(qty))
-    return qty
-
-
-# --- Candle Aggregation and Ejection Logic ---
+# --- Component 1: Candle Aggregator ---
 
 class StrategyCandleAggregator:
-    """Aggregates tick data into 1-minute candles and publishes them."""
+    """
+    Ingests ticks, builds 1-minute candles, and executes the strategy logic directly.
+    """
+    def __init__(self, redis_conn):
+        self.r = redis_conn
+        self.aggregators: Dict[str, Dict[str, Any]] = {} # security_id -> candle_data
+        self.last_ltp: Dict[str, float] = {}
+        # This function pointer will be set by the main loop to link Aggregator -> Strategy
+        self.eject_candle_callback = None 
 
-    def __init__(self):
-        self.aggregators: Dict[str, Dict[str, Any]] = {}  # Security ID -> Candle Data
-        self.LTP_SNAPSHOT: Dict[str, float] = {}  # Security ID -> LTP
-        self.r = r
-        self.candle_channel = REDIS_CANDLE_CHANNEL
-        self.ohlc_key = LIVE_OHLC_KEY
+    def process_tick(self, tick_data: Dict[str, Any]):
+        """
+        Processes a single tick. Dhan ticks structure varies (Ticker vs Full).
+        We handle the common fields.
+        """
+        # Extract Security ID and LTP robustly
+        security_id = str(tick_data.get('securityId', ''))
+        
+        # LTP might be 'LTP', 'last_price', or 'lp' depending on packet type
+        ltp = float(tick_data.get('LTP') or tick_data.get('last_price') or tick_data.get('lp') or 0.0)
+        
+        # Timestamp: 'exchange_time', 'ltt', or current time if missing
+        ts_raw = tick_data.get('exchange_time') or tick_data.get('LTT')
+        if ts_raw:
+            try:
+                # Assuming epoch seconds or milliseconds
+                if int(ts_raw) > 10000000000: # Milliseconds
+                    timestamp = datetime.fromtimestamp(int(ts_raw) / 1000, tz=IST)
+                else:
+                    timestamp = datetime.fromtimestamp(int(ts_raw), tz=IST)
+            except:
+                timestamp = datetime.now(IST)
+        else:
+            timestamp = datetime.now(IST)
 
-    def aggregate_tick(self, tick_data):
-        """Processes a single tick update (received via Redis Pub/Sub)."""
+        if not security_id or ltp == 0:
+            return
 
-        # We assume the incoming tick_data uses Dhan's Security ID as the primary key
-        security_id = str(tick_data.get('securityId'))
-        ltp = tick_data.get('ltp')
-        timestamp_ms = tick_data.get('lastTradeTime')
-
-        if not security_id or not ltp or not timestamp_ms: return
-
-        # 1. Update LTP Snapshot for real-time monitoring
-        self.LTP_SNAPSHOT[security_id] = float(ltp)
-        self.r.set(self.ohlc_key, json.dumps(self.LTP_SNAPSHOT))  # Persist snapshot
-
-        # Determine the current 1-minute candle key
-        tick_time = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=IST)
-        candle_timestamp = tick_time.replace(second=0, microsecond=0)
-
-        # 2. Candle Aggregation Logic
+        # 1. Update Live Snapshot (Used by strategy monitor/dashboard)
+        self.last_ltp[security_id] = ltp
+        # Optimization: You might persist this to Redis key LIVE_OHLC_KEY periodically here
+        
+        # 2. Candle Logic
+        candle_ts = timestamp.replace(second=0, microsecond=0)
+        
         if security_id in self.aggregators:
             current_candle = self.aggregators[security_id]
-            current_ts = current_candle['ts']
-
-            if candle_timestamp > current_ts:
-                # Eject and Publish the Completed Candle
-                self._eject_candle(security_id, current_candle)
-                # Start the new candle
-                self.aggregators[security_id] = self._create_new_candle(security_id, candle_timestamp, ltp)
+            
+            # Check if we moved to a new minute
+            if candle_ts > current_candle['ts']:
+                # EJECT the finished candle to the strategy
+                self.eject_candle(current_candle)
+                # Start new candle
+                self.aggregators[security_id] = self._new_candle(security_id, candle_ts, ltp)
             else:
-                # Update the ongoing candle
-                current_candle['high'] = max(current_candle['high'], float(ltp))
-                current_candle['low'] = min(current_candle['low'], float(ltp))
-                current_candle['close'] = float(ltp)
-                # Volume update logic is omitted but assumed to be here if raw V data is available
+                # Update existing candle
+                current_candle['high'] = max(current_candle['high'], ltp)
+                current_candle['low'] = min(current_candle['low'], ltp)
+                current_candle['close'] = ltp
         else:
-            # Initialize the first candle
-            self.aggregators[security_id] = self._create_new_candle(security_id, candle_timestamp, ltp)
+            # First tick for this symbol
+            self.aggregators[security_id] = self._new_candle(security_id, candle_ts, ltp)
 
-    def _create_new_candle(self, security_id, timestamp, ltp):
-        """Initializes a new candle dictionary."""
-        price = float(ltp)
+    def _new_candle(self, sec_id, ts, price):
         return {
-            'security_id': security_id,
-            'ts': timestamp,
+            'security_id': sec_id,
+            'ts': ts,
             'open': price,
             'high': price,
             'low': price,
-            'close': price,
-            'volume': 0
+            'close': price
         }
 
-    def _eject_candle(self, security_id, completed_candle):
-        """Publishes a completed candle to Redis for the Strategy Engine to consume."""
-
-        ts_str = completed_candle['ts'].isoformat()
-        trading_symbol = SECURITY_ID_TO_SYMBOL.get(security_id, security_id)  # Resolve symbol for trade model
-
-        payload = {
-            'symbol': trading_symbol,
-            'security_id': security_id,
-            'ts': ts_str,
-            'open': completed_candle['open'],
-            'high': completed_candle['high'],
-            'low': completed_candle['low'],
-            'close': completed_candle['close'],
-            'volume': completed_candle['volume'],
-        }
-
-        self.r.publish(self.candle_channel, json.dumps(payload))
-        # print(f"[{datetime.now(IST).strftime('%H:%M:%S')}] EJECTED CANDLE for {trading_symbol}")
+    def eject_candle(self, candle):
+        """Passes the completed candle to the strategy callback."""
+        if self.eject_candle_callback:
+            # Resolve Symbol using the Reverse Map
+            symbol = SECURITY_ID_TO_SYMBOL.get(candle['security_id'])
+            if symbol:
+                candle['symbol'] = symbol
+                # Direct In-Memory transfer for lowest latency
+                self.eject_candle_callback(candle)
 
 
-# --- Cash Breakout Strategy Implementation ---
+# --- Component 2: Cash Breakout Strategy ---
 
 class CashBreakoutStrategy:
-    """Implements the Long Breakout logic for Dhan."""
-
+    """
+    Core Logic: PDH Breakout, Entry/Exit Execution, Risk Management.
+    """
     def __init__(self):
-        self.r = r
-        self.DHAN_CLIENT = DHAN_CLIENT
-        self.settings = StrategySettings.objects.first()  # Should be only one instance
+        # Load initial settings from DB
+        self.settings = StrategySettings.objects.first()
         if not self.settings:
-            print("CRITICAL: StrategySettings not found in DB!")
+            print("WARNING: StrategySettings not found. Strategy disabled.")
             self.running = False
         else:
             self.running = self.settings.is_enabled
+            
+        self.active_trades = {} # In-memory tracker for speed
+        self.load_trades()
+        
+        # Load global counters for limits
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        self.trade_count_key = f"trade_count:{today_str}"
+        self.daily_pnl_key = f"daily_pnl:{today_str}"
 
-        self.active_trades: Dict[str, CashBreakoutTrade] = {}  # Symbol -> Trade object
-        self.trade_count_key = f"breakout_trade_count:{CLIENT_ID}:{datetime.now(IST).date().isoformat()}"
-        self.daily_pnl_key = f"cb_daily_realized_pnl:{CLIENT_ID}:{datetime.now(IST).date().isoformat()}"
-        self.active_entries_set = f"breakout_active_entries:{CLIENT_ID}"
-        self.exiting_trades_set = f"breakout_exiting_trades:{CLIENT_ID}"
+    def load_trades(self):
+        """Syncs in-memory state with Database (on startup or refresh)."""
+        open_trades = CashBreakoutTrade.objects.filter(
+            status__in=['OPEN', 'PENDING_ENTRY', 'PENDING_EXIT']
+        )
+        self.active_trades = {t.symbol: t for t in open_trades}
+        print(f"Strategy: Loaded {len(self.active_trades)} active trades.")
 
-        self.load_trades_from_db()
-
-    def load_trades_from_db(self):
-        """Refreshes active trades from the database for in-memory monitoring."""
-        self.active_trades = {
-            t.symbol: t for t in CashBreakoutTrade.objects.filter(
-                status__in=['OPEN', 'PENDING_ENTRY', 'PENDING_EXIT']
-            ).select_related('strategy')  # Prefetch strategy
-        }
-
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(0.05))
-    def _check_and_increment_trade_count(self) -> bool:
-        """Atomically checks global limit and increments counter (Simplified)."""
-        max_trades_total = self.settings.max_total_trades
-        current_count = int(r.get(self.trade_count_key) or 0)
-
-        if current_count >= max_trades_total:
-            print(f"LIMIT REACHED: Max total trades ({max_trades_total}) exceeded.")
-            return False
-
-        r.incr(self.trade_count_key)
-        r.expire(self.trade_count_key, 86400)
-        return True
-
-    def _rollback_trade_count(self) -> None:
-        """Decrement the global daily trade count after an aborted entry attempt."""
-        current_count = int(r.get(self.trade_count_key) or 0)
-        if current_count > 0:
-            r.decr(self.trade_count_key)
-
-    def _dhan_place_order(self, security_id, symbol, quantity, txn_type, order_type, trigger_price=0.0):
-        """Dhan-compatible order placement wrapper with required fields."""
-        if not self.DHAN_CLIENT:
-            return None
-
+    def get_prev_day_high(self, symbol):
+        """Fetches T-1 High from Redis cache (populated by management command)."""
         try:
-            exchange_segment = self.DHAN_CLIENT.NSE
-            product_type = self.DHAN_CLIENT.INTRA  # Cash trading only
+            raw = r.hget(settings.PREV_DAY_HASH, symbol)
+            if raw:
+                data = json.loads(raw)
+                return float(data.get('high', 0))
+        except: pass
+        return None
 
-            response = self.DHAN_CLIENT.place_order(
-                security_id=security_id,
-                exchange_segment=exchange_segment,
-                transaction_type=txn_type,
-                quantity=quantity,
-                order_type=order_type,
-                product_type=product_type,
+    def process_candle(self, candle):
+        """Called when a 1-minute candle is completed."""
+        if not self.running or not DHAN_CLIENT: return
+        
+        symbol = candle['symbol']
+        
+        # 1. Skip if already active
+        if symbol in self.active_trades: return
+        
+        # 2. Get PDH
+        pdh = self.get_prev_day_high(symbol)
+        if not pdh: return
+
+        # 3. Breakout Logic
+        open_p = candle['open']
+        close_p = candle['close']
+        high_p = candle['high']
+        low_p = candle['low']
+        
+        # Condition A: Bullish Candle closing above Open
+        if close_p <= open_p: return
+        # Condition B: Opened BELOW PDH, Closed ABOVE PDH (Clean Breakout)
+        if not (open_p < pdh < close_p): return
+        
+        # 4. Parameters & Limits
+        entry_price = high_p * (1.0 + settings.ENTRY_OFFSET_PCT)
+        stop_loss = low_p * (1.0 - settings.STOP_OFFSET_PCT)
+        
+        risk_per_share = entry_price - stop_loss
+        if risk_per_share <= 0: return
+        
+        # Target R:R
+        target = entry_price + (settings.RISK_MULTIPLIER * risk_per_share)
+        
+        # Calculate Qty based on Risk Amount
+        qty = floor(self.settings.per_trade_sl_amount / risk_per_share)
+        if qty <= 0: return
+
+        # Check Global Limits (Atomic Redis Increment)
+        current_count = r.incr(self.trade_count_key)
+        if current_count > self.settings.max_total_trades:
+            r.decr(self.trade_count_key) # Revert count if limit hit
+            return
+            
+        # Check per-stock limit (simplified check against DB history omitted for speed, relies on active_trades)
+
+        # 5. Place Entry Order (SL-M)
+        try:
+            print(f"SIGNAL: {symbol} Breakout. Placing Buy Order {qty} @ {entry_price:.2f}")
+            response = DHAN_CLIENT.place_order(
+                security_id=candle['security_id'],
+                exchange_segment=DHAN_CLIENT.NSE,
+                transaction_type=DHAN_CLIENT.BUY,
+                quantity=qty,
+                order_type=DHAN_CLIENT.SLM, # Stop Loss Market Trigger
+                product_type=DHAN_CLIENT.INTRA,
                 price=0,
-                trigger_price=round(trigger_price, 2) if order_type == self.DHAN_CLIENT.SLM else 0.0
+                trigger_price=round(entry_price, 2)
             )
-
-            # Dhan API returns orderId directly in the response dictionary on success
-            if response and response.get('orderId'):
-                return response
+            
+            if response.get('status') == 'success' or response.get('orderId'):
+                # Create DB Record
+                with transaction.atomic():
+                    trade = CashBreakoutTrade.objects.create(
+                        strategy=self.settings,
+                        symbol=symbol,
+                        security_id=candle['security_id'],
+                        quantity=qty,
+                        status='PENDING_ENTRY',
+                        entry_level=entry_price,
+                        stop_level=stop_loss,
+                        target_level=target,
+                        candle_ts=candle['ts'],
+                        prev_day_high=pdh,
+                        entry_order_id=response.get('orderId')
+                    )
+                    self.active_trades[symbol] = trade
             else:
-                print(f"ORDER FAILED (API): {response.get('message', 'Unknown Error')}")
-                return None
+                r.decr(self.trade_count_key) # Revert limit if API failed
+                print(f"Order Failed for {symbol}: {response}")
 
         except Exception as e:
-            print(f"ORDER FAILED (Exception) for {symbol}: {e}")
-            return None
+            r.decr(self.trade_count_key)
+            print(f"Exception placing order for {symbol}: {e}")
 
-    def process_completed_candle(self, candle_payload: Dict[str, Any]):
-        """
-        Implements the Entry Signal Logic using the completed 1-minute candle.
-        """
-        if not self.settings.is_enabled: return
-
-        symbol = candle_payload.get("symbol")
-        security_id = candle_payload.get("security_id")
-
-        # 1. Check if symbol is already active
-        if symbol in self.active_trades: return
-
-        prev_high = _get_prev_day_high(symbol)
-        if prev_high is None: return
-
-        # Extract candle data
-        try:
-            low = float(candle_payload.get("low") or 0.0)
-            high = float(candle_payload.get("high") or 0.0)
-            vol = int(candle_payload.get("volume") or 0)
-            candle_open = float(candle_payload.get("open") or 0.0)
-            candle_close = float(candle_payload.get("close") or 0.0)
-            candle_ts = datetime.fromisoformat(candle_payload.get("ts")).astimezone(IST)
-        except Exception:
+    def monitor_trades(self, live_ltp_map):
+        """Checks open trades for Exit conditions (SL/Target/TSL) based on live LTP."""
+        if not self.running: return
+        
+        # Time Exit Check
+        if datetime.now(IST).time() >= self.settings.end_time:
+            self.close_all_positions("End of Day")
             return
 
-        ref_price = candle_close if candle_close > 0 else (high if high > 0 else 1.0)
-
-        # --- Entry Filters (Core Breakout Logic) ---
-        if not (candle_close > candle_open): return  # Bullish candle
-        if not (low < prev_high < candle_close): return  # PDH must be crossed cleanly (entry candle)
-        if not (candle_open < prev_high): return  # Must have opened below PDH
-
-        size_pct = (high - low) / ref_price if ref_price else 0.0
-        if size_pct > self.settings.max_candle_pct: return  # Max candle size filter
-
-        # --- Compute PENDING entry / stop / target ---
-        entry_level = high * (1.0 + self.settings.entry_offset_pct)
-        stop_level = low - (low * self.settings.stop_offset_pct)
-        stop_distance_prelim = entry_level - stop_level
-        target_level_prelim = entry_level + (RISK_MULTIPLIER * stop_distance_prelim)
-
-        # 2. Calculate Quantity and Check Limits
-        quantity = _calculate_quantity(self.settings.per_trade_sl_amount, entry_level, stop_level)
-        if quantity <= 0: return
-
-        # Atomically check and increment global limit *before* placing order
-        if not self._check_and_increment_trade_count(): return
-
-        # 3. Place Stop-Limit Market Entry Order (SLM BUY)
-        order_response = self._dhan_place_order(
-            security_id=security_id,
-            symbol=symbol,
-            quantity=quantity,
-            txn_type=self.DHAN_CLIENT.BUY,
-            order_type=self.DHAN_CLIENT.SLM,
-            trigger_price=entry_level  # Entry trigger price
-        )
-
-        if not order_response:
-            self._rollback_trade_count()
-            return
-
-        # 4. Store PENDING_ENTRY trade to DB
-        with transaction.atomic():
-            trade = CashBreakoutTrade.objects.create(
-                strategy=self.settings,
-                symbol=symbol,
-                security_id=security_id,
-                quantity=quantity,
-                status="PENDING_ENTRY",
-                entry_order_id=order_response.get('orderId'),
-                candle_ts=candle_ts,
-                prev_day_high=prev_high,
-                entry_level=round(entry_level, 6),
-                stop_level=round(stop_level, 6),
-                target_level=round(target_level_prelim, 6),
-                candle_high=high,
-                candle_low=low,
-                volume_price=vol * ref_price
-            )
-            self.active_trades[symbol] = trade
-            self.r.sadd(self.active_entries_set, symbol)
-            print(f"PENDING TRADE REGISTERED: {symbol} @ {entry_level}")
-
-    def monitor_open_trades(self):
-        """
-        Monitors open trades for SL/Target/TSL/Time exit conditions.
-        Runs in the fast main loop.
-        """
-        if not self.settings.is_enabled: return
-
-        try:
-            raw_ohlc = self.r.get(LIVE_OHLC_KEY)
-            live_ohlc = json.loads(raw_ohlc) if raw_ohlc else {}
-        except Exception:
-            live_ohlc = {}
-
-        unrealized_pnl = 0.0
-        now_time = datetime.now(IST).time()
-
-        # --- Time Square Off Check ---
-        if now_time >= self.settings.end_time:
-            self.force_square_off("Breakout End Time Reached")
-            return
-
-        for trade in list(self.active_trades.values()):
-            if trade.status != "OPEN":
-                continue
-
-            ltp = live_ohlc.get(trade.security_id, 0.0)
-            if ltp == 0.0: continue
-
-            if trade.entry_price:
-                unrealized_pnl += (ltp - trade.entry_price) * trade.quantity
-                risk_per_share = trade.entry_price - trade.stop_level
-            else:
-                risk_per_share = 0.0
-
-            # --- Breakeven TSL (1:1.25 R:R) Logic ---
-            if risk_per_share > 0 and trade.stop_level < trade.entry_price:
-                breakeven_trigger_price = trade.entry_price + (BREAKEVEN_TRIGGER_R * risk_per_share)
-
-                if ltp >= breakeven_trigger_price:
-                    new_stop_level = trade.entry_price
-                    if new_stop_level > trade.stop_level:
-                        trade.stop_level = round(new_stop_level, 6)
-                        trade.save(update_fields=['stop_level', 'updated_at'])
-                        print(f"TSL MOVED for {trade.symbol} to Entry: {trade.stop_level}")
-
-            # --- Exit Condition 1: Stop Loss Hit ---
-            if ltp <= trade.stop_level:
-                self.exit_trade(trade, "SL/TSL Hit")
-                continue
-
-            # --- Exit Condition 2: Target Hit (2.5R) ---
+        for symbol, trade in list(self.active_trades.items()):
+            if trade.status != 'OPEN': continue
+            
+            ltp = live_ltp_map.get(trade.security_id, 0)
+            if ltp == 0: continue
+            
+            # A. Target Hit
             if ltp >= trade.target_level:
-                self.exit_trade(trade, f"Target Hit ({RISK_MULTIPLIER}R)")
+                self.exit_trade(trade, "Target Hit")
                 continue
+            
+            # B. Stop Loss Hit
+            if ltp <= trade.stop_level:
+                self.exit_trade(trade, "Stop Loss Hit")
+                continue
+                
+            # C. Trailing SL (Breakeven)
+            if trade.stop_level < trade.entry_level:
+                risk = trade.entry_level - trade.stop_level
+                # Trigger point to move SL to Breakeven
+                trigger = trade.entry_level + (settings.BREAKEVEN_TRIGGER_R * risk)
+                
+                if ltp >= trigger:
+                    trade.stop_level = trade.entry_level
+                    trade.save()
+                    print(f"TSL: Moved {symbol} SL to Breakeven.")
 
-        # Check Global P&L Limits
-        self._check_pnl_exit_conditions(unrealized_pnl)
-
-    def _check_pnl_exit_conditions(self, unrealized_pnl: float):
-        """Checks global daily P&L against limits."""
-        if not self.settings.pnl_exit_enabled: return
-
-        realized_pnl = float(self.r.get(self.daily_pnl_key) or 0.0)
-        net_pnl = realized_pnl + unrealized_pnl
-        profit_target = self.settings.pnl_profit_target
-        stop_loss = -self.settings.pnl_stop_loss
-
-        if net_pnl >= profit_target or net_pnl <= stop_loss:
-            reason = "Daily P&L Target Reached" if net_pnl >= profit_target else "Daily P&L Stop Loss Reached"
-            print(f"P&L EXIT TRIGGERED: {reason}. Net PnL: {net_pnl:.2f}")
-            self.force_square_off(reason)
-
-    def exit_trade(self, trade: CashBreakoutTrade, reason: str):
-        """Places a market exit order for an OPEN trade."""
-        if trade.status != "OPEN": return
-        if self.r.sismember(self.exiting_trades_set, trade.id): return
-
-        order_response = self._dhan_place_order(
-            security_id=trade.security_id,
-            symbol=trade.symbol,
-            quantity=abs(trade.quantity),
-            txn_type=self.DHAN_CLIENT.SELL,
-            order_type=self.DHAN_CLIENT.MARKET
-        )
-
-        if order_response and order_response.get('orderId'):
-            with transaction.atomic():
-                trade.status = "PENDING_EXIT"
-                trade.exit_order_id = order_response['orderId']
-                trade.exit_reason = reason
-                trade.save()
-                self.r.sadd(self.exiting_trades_set, trade.id)
-                print(f"EXIT ORDER PLACED for {trade.symbol} reason={reason}")
-        else:
-            trade.status = "FAILED_EXIT"
-            trade.exit_order_id = None
+    def exit_trade(self, trade, reason):
+        """Places Market Exit Order."""
+        if not DHAN_CLIENT: return
+        try:
+            DHAN_CLIENT.place_order(
+                security_id=trade.security_id,
+                exchange_segment=DHAN_CLIENT.NSE,
+                transaction_type=DHAN_CLIENT.SELL,
+                quantity=trade.quantity,
+                order_type=DHAN_CLIENT.MARKET,
+                product_type=DHAN_CLIENT.INTRA,
+                price=0
+            )
+            # We DO NOT update DB status to 'CLOSED' here. 
+            # We set it to PENDING_EXIT and wait for the WebSocket Order Update 
+            # to confirm the fill. This prevents race conditions.
+            trade.status = 'PENDING_EXIT'
+            trade.exit_reason = reason
             trade.save()
-            print(f"CRITICAL: Failed to place exit order for {trade.symbol}.")
+            print(f"EXIT: Sent Sell for {trade.symbol}. Reason: {reason}")
+        except Exception as e:
+            print(f"Exit Failed for {trade.symbol}: {e}")
 
-    def force_square_off(self, reason: str):
-        """Closes all currently OPEN positions."""
-        for trade in list(self.active_trades.values()):
-            if trade.status == "OPEN":
-                self.exit_trade(trade, reason)
-                time.sleep(0.1)
-
-
-def run_pending_monitor(strategy: CashBreakoutStrategy):
-    """
-    Checks PENDING_ENTRY trades for the 6-minute time expiry or if LTP falls below stop.
-    This logic runs in the fast loop, independent of candle closure.
-    """
-    now = datetime.now(IST)
-
-    # Load latest LTP snapshot from Redis
-    try:
-        raw_ohlc = r.get(LIVE_OHLC_KEY)
-        live_ohlc = json.loads(raw_ohlc) if raw_ohlc else {}
-    except Exception:
-        live_ohlc = {}
-
-    # 1. First, retrieve all pending trades from the database for atomic updates
-    pending_qs = CashBreakoutTrade.objects.filter(status='PENDING_ENTRY').select_for_update()
-
-    for trade in pending_qs:
-        cancel_reason = None
-
-        # 1. 6-minute expiry check
-        expiry_dt = trade.candle_ts + timedelta(minutes=MAX_MONITORING_MINUTES)
-        if now > expiry_dt:
-            cancel_reason = "Expired (6-minute limit reached)"
-
-        # 2. LTP vs Stop Level check
-        ltp = live_ohlc.get(trade.security_id, 0.0)
-        if ltp != 0.0 and ltp < trade.stop_level:
-            cancel_reason = cancel_reason or "LTP fell below stop level"
-
-        if cancel_reason:
-            # Attempt to cancel the order at Dhan
-            if DHAN_CLIENT and trade.entry_order_id:
-                try:
-                    DHAN_CLIENT.cancel_order(trade.entry_order_id)
-                except Exception:
-                    # Ignore failure to send cancel signal, reconciliation handles status change
-                    pass
-
-            # Update DB to EXPIRED. Reconciliation loop will confirm if it filled/cancelled.
-            with transaction.atomic():
-                # We need to lock and refetch here because we are outside the main loop's control flow
-                trade.status = 'EXPIRED'
-                trade.save()
-                strategy._rollback_trade_count()
-                strategy.active_trades.pop(trade.symbol, None)
-                r.srem(strategy.active_entries_set, trade.symbol)
-                print(f"PENDING TRADE MARKED EXPIRED: {trade.symbol}")
+    def close_all_positions(self, reason):
+        for t in self.active_trades.values():
+            if t.status == 'OPEN':
+                self.exit_trade(t, reason)
 
 
-# --- MAIN EXECUTION LOOP ---
+# --- Component 3: Reconciliation (Event Driven via Stream) ---
+
+def handle_order_update(order_data, strategy):
+    """Updates trade status based on WebSocket Order Update events from Stream."""
+    
+    order_id = order_data.get('orderId') or order_data.get('OrderNo')
+    status = order_data.get('orderStatus') or order_data.get('OrderStatus')
+    
+    if not order_id or not status: return
+
+    # Check if this order belongs to any active trade
+    trade = None
+    is_entry = False
+    
+    # Search in-memory first for speed
+    for t in strategy.active_trades.values():
+        if t.entry_order_id == order_id:
+            trade = t
+            is_entry = True
+            break
+        elif t.exit_order_id == order_id:
+            trade = t
+            is_entry = False
+            break
+            
+    # If not in memory (e.g. after restart), check DB
+    if not trade:
+        try:
+            trade = CashBreakoutTrade.objects.filter(entry_order_id=order_id).first()
+            if trade: is_entry = True
+            else:
+                trade = CashBreakoutTrade.objects.filter(exit_order_id=order_id).first()
+                is_entry = False
+        except: pass
+        
+    if not trade: return # Order not related to our algo
+
+    # -- Process Status --
+    if status == 'TRADED':
+        fill_price = float(order_data.get('tradedPrice') or order_data.get('TradedPrice') or 0)
+        
+        if is_entry and trade.status == 'PENDING_ENTRY':
+            # ENTRY FILLED
+            trade.status = 'OPEN'
+            trade.entry_price = fill_price
+            trade.entry_time = timezone.now()
+            trade.save()
+            strategy.active_trades[trade.symbol] = trade # Ensure in memory
+            print(f"CONFIRMED: Entry Filled for {trade.symbol} @ {fill_price}")
+            
+        elif not is_entry and trade.status in ['OPEN', 'PENDING_EXIT']:
+            # EXIT FILLED
+            trade.status = 'CLOSED'
+            trade.exit_price = fill_price
+            trade.exit_time = timezone.now()
+            trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+            trade.save()
+            
+            # Remove from active monitoring
+            if trade.symbol in strategy.active_trades:
+                del strategy.active_trades[trade.symbol]
+            
+            # Update PnL in Redis for dashboard
+            r.incrbyfloat(strategy.daily_pnl_key, trade.pnl)
+            print(f"CONFIRMED: Exit Filled for {trade.symbol}. PnL: {trade.pnl}")
+
+    elif status in ['CANCELLED', 'REJECTED', 'EXPIRED']:
+        if is_entry:
+            trade.status = 'FAILED_ENTRY'
+            trade.save()
+            if trade.symbol in strategy.active_trades:
+                del strategy.active_trades[trade.symbol]
+            # Revert trade count since entry failed
+            r.decr(strategy.trade_count_key)
+            print(f"ORDER CANCELLED/REJECTED for {trade.symbol}")
+
+
+# --- MAIN ENGINE LOOP (STREAMS) ---
 
 def run_algo_engine():
-    """Main loop to orchestrate data aggregation and strategy execution."""
-
-    r.set(REDIS_STATUS_ALGO_ENGINE, 'STARTING')
-    # Load the global symbol/ID maps from the Redis keys populated by dhan_workers.py
-    global SYMBOL_TO_SECURITY_ID, SECURITY_ID_TO_SYMBOL
-    try:
-        SYMBOL_TO_SECURITY_ID = json.loads(r.get('SYMBOL_TO_SECURITY_ID') or '{}')
-        SECURITY_ID_TO_SYMBOL = json.loads(r.get('SECURITY_ID_TO_SYMBOL') or '{}')
-    except Exception:
-        print("WARNING: Could not load initial security mappings from Redis.")
-        pass
-
-    token = r.get(REDIS_DHAN_TOKEN_KEY)
-    if token:
-        get_dhan_client(token)
-
-    aggregator = StrategyCandleAggregator()
+    global DHAN_CLIENT
+    r.set(settings.REDIS_STATUS_ALGO_ENGINE, 'STARTING')
+    print(f"[{datetime.now()}] Algo Engine Starting in STREAM Mode...")
+    
+    # 1. Setup Redis Consumer Groups
+    setup_consumer_groups()
+    
+    # 2. Initialize Components
+    aggregator = StrategyCandleAggregator(r)
     strategy = CashBreakoutStrategy()
+    
+    # Hook aggregator output directly to strategy
+    aggregator.eject_candle_callback = strategy.process_candle
 
-    r.set(REDIS_STATUS_ALGO_ENGINE, 'RUNNING')
-    print(f"[{datetime.now()}] Algo Trading Engine Ready.")
+    # 3. Load Initial Token
+    token = r.get(settings.REDIS_DHAN_TOKEN_KEY)
+    if token:
+        DHAN_CLIENT = get_dhan_client(token)
+        print("Dhan Client Initialized.")
+    else:
+        print("Waiting for Token from Dashboard...")
 
-    # Subscribe to ALL necessary Redis channels
-    pubsub = r.pubsub()
-    pubsub.subscribe(REDIS_DATA_CHANNEL, REDIS_ORDER_UPDATE_CHANNEL, REDIS_CANDLE_CHANNEL, REDIS_CONTROL_CHANNEL,
-                     REDIS_AUTH_CHANNEL)
+    r.set(settings.REDIS_STATUS_ALGO_ENGINE, 'RUNNING')
 
-    last_monitor_time = time.time()
-
-    for message in pubsub.listen():
-        if message['type'] != 'message': continue
-
-        channel = message['channel']
+    # 4. Stream Processing Loop
+    while True:
         try:
-            data = json.loads(message['data'])
-        except json.JSONDecodeError:
-            continue
+            # Read from all streams using Consumer Group
+            # '>' means read only new messages that have arrived since last read
+            streams = {
+                settings.REDIS_STREAM_MARKET: '>',
+                settings.REDIS_STREAM_ORDERS: '>',
+                settings.REDIS_STREAM_CONTROL: '>'
+            }
+            
+            # Block for 100ms to reduce CPU usage if empty
+            response = r.xreadgroup(
+                settings.REDIS_CONSUMER_GROUP, 
+                settings.REDIS_CONSUMER_NAME, 
+                streams, 
+                count=100, 
+                block=100
+            )
 
-        # A. New Market Tick -> Aggregation (Ultra Low Latency Path)
-        if channel == REDIS_DATA_CHANNEL:
-            aggregator.aggregate_tick(data)
+            if not response:
+                # Idle Loop: Monitor Open Trades (approx 10 times per second)
+                if strategy.active_trades and aggregator.last_ltp:
+                    strategy.monitor_trades(aggregator.last_ltp)
+                continue
 
-        # B. Completed Candle -> Strategy Entry Check
-        elif channel == REDIS_CANDLE_CHANNEL:
-            now_time = datetime.now(IST).time()
-            if strategy.settings and now_time >= strategy.settings.start_time and now_time <= strategy.settings.end_time:
-                strategy.process_completed_candle(data)
+            for stream_name, messages in response:
+                for message_id, data in messages:
+                    try:
+                        # Parse the 'p' (payload) field
+                        payload_str = data.get('p')
+                        if not payload_str: 
+                            r.xack(stream_name, settings.REDIS_CONSUMER_GROUP, message_id)
+                            continue
+                            
+                        payload = json.loads(payload_str)
 
-        # C. Live Order Update -> Instant Reconciliation (Critical Low Latency Path)
-        elif channel == REDIS_ORDER_UPDATE_CHANNEL:
-            handle_low_latency_reconciliation(data, strategy)
+                        if stream_name == settings.REDIS_STREAM_MARKET:
+                            # MARKET DATA -> Aggregator
+                            aggregator.process_tick(payload)
+                            # Monitor trades frequently on tick arrival as well
+                            strategy.monitor_trades(aggregator.last_ltp)
+                        
+                        elif stream_name == settings.REDIS_STREAM_ORDERS:
+                            # ORDER UPDATE -> Reconciliation
+                            handle_order_update(payload, strategy)
+                        
+                        elif stream_name == settings.REDIS_STREAM_CONTROL:
+                            # CONTROL SIGNAL -> Settings/Auth
+                            if payload.get('action') == 'UPDATE_CONFIG':
+                                strategy.settings.refresh_from_db()
+                                strategy.running = strategy.settings.is_enabled
+                                strategy.load_trades()
+                                print(f"Settings Reloaded. Enabled: {strategy.running}")
+                            elif payload.get('action') == 'TOKEN_REFRESH':
+                                DHAN_CLIENT = get_dhan_client(payload.get('token'))
+                                print("Token Refreshed via Control Stream.")
 
-        # D. Control/Auth Channel Updates
-        elif channel == REDIS_CONTROL_CHANNEL and data.get('action') == 'UPDATE_CONFIG':
-            strategy.settings.refresh_from_db()
-            strategy.running = strategy.settings.is_enabled
-            strategy.load_trades_from_db()
+                        # Acknowledge message processed
+                        r.xack(stream_name, settings.REDIS_CONSUMER_GROUP, message_id)
 
-        elif channel == REDIS_AUTH_CHANNEL and data.get('action') == 'TOKEN_REFRESH':
-            get_dhan_client(data.get('token'))
+                    except Exception as e:
+                        print(f"Error processing message {message_id} from {stream_name}: {e}")
+                        # Ack even on error to prevent infinite loops on bad data
+                        r.xack(stream_name, settings.REDIS_CONSUMER_GROUP, message_id)
 
-        # E. Fast Loop Monitoring (Runs every RECONCILIATION_INTERVAL_SECONDS)
-        if time.time() - last_monitor_time >= RECONCILIATION_INTERVAL_SECONDS:
-            last_monitor_time = time.time()
-            if strategy.running:
-                strategy.monitor_open_trades()  # SL/Target/TSL check
-                run_pending_monitor(strategy)  # 6-minute pending expiry check
-
-
-def handle_low_latency_reconciliation(order_data: Dict[str, Any], strategy: CashBreakoutStrategy):
-    """Processes real-time order status updates via Dhan WebSocket (replaces Kite polling)."""
-
-    dhan_order_id = order_data.get('OrderNo')
-    status = order_data.get('OrderStatus')
-    traded_qty = order_data.get('TradedQty')
-    traded_price = order_data.get('TradedPrice')
-
-    if not dhan_order_id or not status: return
-
-    try:
-        trade = CashBreakoutTrade.objects.filter(entry_order_id=dhan_order_id).first()
-        is_entry = True
-        if not trade:
-            trade = CashBreakoutTrade.objects.filter(exit_order_id=dhan_order_id).first()
-            is_entry = False
-        if not trade: return
-    except Exception:
-        return
-
-    # Using select_for_update to handle concurrency if multiple algo engines run
-    with transaction.atomic():
-        trade = CashBreakoutTrade.objects.select_for_update().get(id=trade.id)
-
-        if status == 'TRADED' and int(traded_qty or 0) > 0:
-            if is_entry and trade.status == 'PENDING_ENTRY':
-                # Entry Filled
-                risk_per_share = float(traded_price) - trade.stop_level
-                dynamic_target_level = float(traded_price) + (RISK_MULTIPLIER * risk_per_share)
-
-                trade.status = 'OPEN'
-                trade.entry_price = float(traded_price)
-                trade.entry_time = timezone.now()
-                trade.target_level = round(dynamic_target_level, 6)
-
-                strategy.active_trades[trade.symbol] = trade
-                print(f"ENTRY FILLED: {trade.symbol} @ {trade.entry_price}")
-
-            elif not is_entry and trade.status == 'PENDING_EXIT':
-                # Exit Filled
-                trade.status = 'CLOSED'
-                trade.exit_price = float(traded_price)
-                trade.exit_time = timezone.now()
-                pnl = (trade.exit_price - trade.entry_price) * trade.quantity
-                trade.pnl = pnl
-
-                r.incrbyfloat(strategy.daily_pnl_key, pnl)
-
-                strategy.active_trades.pop(trade.symbol, None)
-                r.srem(strategy.active_entries_set, trade.symbol)
-                r.srem(strategy.exiting_trades_set, trade.id)
-                print(f"EXIT FILLED: {trade.symbol}. PnL: {pnl:.2f}")
-
-        elif status in ('CANCELLED', 'REJECTED', 'FAILED', 'EXPIRED'):
-            if is_entry:
-                if trade.status == 'PENDING_ENTRY':
-                    trade.status = 'FAILED_ENTRY'
-                    strategy._rollback_trade_count()
-                    strategy.active_trades.pop(trade.symbol, None)
-                    r.srem(strategy.active_entries_set, trade.symbol)
-                    print(f"ENTRY CANCELLED/REJECTED: {trade.symbol}")
-            elif not is_entry:
-                if trade.status == 'PENDING_EXIT':
-                    trade.status = 'OPEN'
-                    trade.exit_order_id = None
-                    r.srem(strategy.exiting_trades_set, trade.id)
-                    print(f"EXIT FAILED: {trade.symbol}. Reverting to OPEN.")
-
-        trade.save()
-
+        except Exception as e:
+            print(f"Main Loop Error: {e}")
+            time.sleep(1) # Backoff slightly on redis connection errors
 
 if __name__ == '__main__':
     run_algo_engine()
