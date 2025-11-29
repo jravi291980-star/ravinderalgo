@@ -250,10 +250,10 @@ class CashBreakoutStrategy:
                 exchange_segment=DHAN_CLIENT.NSE,
                 transaction_type=DHAN_CLIENT.BUY,
                 quantity=qty,
-                order_type=DHAN_CLIENT.SLM, # Stop Loss Market Trigger
+                order_type=DHAN_CLIENT.MARKET, 
                 product_type=DHAN_CLIENT.INTRA,
                 price=0,
-                trigger_price=round(entry_price, 2)
+
             )
             
             if response.get('status') == 'success' or response.get('orderId'):
