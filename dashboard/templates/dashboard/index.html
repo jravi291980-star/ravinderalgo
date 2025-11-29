@@ -61,17 +61,13 @@
             </div>
         {% endif %}
 
-        <!-- System Health and Auth Grid -->
+        <!-- Top Row: System Health, Auth, and Data Prep -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
 
             <!-- 1. System Health Status -->
-            <div class="card p-6 lg:col-span-2">
-                <h2 class="text-xl font-bold mb-5 text-gray-700">Worker Health Status (Redis)</h2>
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div class="p-3 border rounded-lg bg-gray-50">
-                        <span class="text-sm font-semibold text-gray-600 block mb-1">Web Dyno</span>
-                        <span class="status-pill status-running">LIVE</span>
-                    </div>
+            <div class="card p-6 lg:col-span-1">
+                <h2 class="text-xl font-bold mb-5 text-gray-700">Worker Health Status</h2>
+                <div class="space-y-4">
                     <div class="p-3 border rounded-lg bg-gray-50">
                         <span class="text-sm font-semibold text-gray-600 block mb-1">Data Engine (Worker)</span>
                         {% if data_engine_status == 'RUNNING' %}
@@ -133,6 +129,27 @@
                             Activate Trading Session
                         </button>
                     </div>
+                </form>
+            </div>
+
+            <!-- 3. Instrument Master CSV Upload -->
+            <div class="card p-6 lg:col-span-1 space-y-4">
+                <h2 class="text-xl font-bold text-gray-700">Data Preparation: Instrument Map</h2>
+                <p class="text-sm text-gray-500">Upload the latest Dhan Scrip Master CSV file to update Security IDs required for 448 Nifty stocks.</p>
+                
+                <form method="POST" enctype="multipart/form-data" class="space-y-4">
+                    {% csrf_token %}
+                    
+                    <div class="flex flex-col">
+                        <label for="instrument_csv" class="text-sm font-medium text-gray-600 mb-1">Scrip Master CSV File</label>
+                        <!-- Note: The form field name must match the expected file input in views.py -->
+                        <input type="file" name="instrument_csv" id="instrument_csv" accept=".csv" required class="p-2 border rounded-md">
+                    </div>
+                    
+                    <button type="submit" name="upload_instruments" class="w-full bg-orange-500 text-white py-2 px-4 rounded-md hover:bg-orange-600 transition duration-150 font-semibold shadow-md">
+                        Upload & Cache Instruments
+                    </button>
+                    <p class="text-xs text-green-700">Cached Instruments: 448 (from last run)</p>
                 </form>
             </div>
         </div>
