@@ -328,6 +328,7 @@ import os
 import time
 import threading
 import sys
+import asyncio # <--- Essential for fixing the event loop error
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -355,12 +356,11 @@ except ImportError:
 r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
 IST = settings.IST
 
-# Reverse Map for Symbol Lookup (Needed for tagging candles)
 SECURITY_ID_TO_SYMBOL = {str(v): k for k, v in settings.SECURITY_ID_MAP.items()}
 
 INSTRUMENTS_TO_SUBSCRIBE: List[tuple] = []
 
-# --- CANDLE AGGREGATOR CLASS (Moved Here) ---
+# --- CANDLE AGGREGATOR CLASS ---
 class LiveCandleAggregator:
     def __init__(self, redis_conn):
         self.r = redis_conn
@@ -368,15 +368,12 @@ class LiveCandleAggregator:
         self.last_ltp: Dict[str, float] = {}
 
     def process_tick(self, tick_data: Dict[str, Any]):
-        # 1. Extract Data
         security_id = str(tick_data.get('securityId', ''))
         ltp = float(tick_data.get('LTP') or tick_data.get('last_price') or tick_data.get('lp') or 0.0)
         
-        # Timestamp logic
         ts_raw = tick_data.get('exchange_time') or tick_data.get('LTT')
         if ts_raw:
             try:
-                # Handle milliseconds vs seconds
                 if int(ts_raw) > 10000000000: timestamp = datetime.fromtimestamp(int(ts_raw) / 1000, tz=IST)
                 else: timestamp = datetime.fromtimestamp(int(ts_raw), tz=IST)
             except: timestamp = datetime.now(IST)
@@ -384,22 +381,16 @@ class LiveCandleAggregator:
 
         if not security_id or ltp == 0: return
 
-        # 2. Update Live Snapshot (For Dashboard/Monitor)
         self.last_ltp[security_id] = ltp
-        # Optional: Persist ltp to Redis periodically if needed
         
-        # 3. Candle Construction
         candle_ts = timestamp.replace(second=0, microsecond=0)
         
         if security_id in self.aggregators:
             current = self.aggregators[security_id]
             if candle_ts > current['ts']:
-                # Minute changed: Finalize old candle
                 self.finalize_candle(current)
-                # Start new candle
                 self.aggregators[security_id] = self._new_candle(security_id, candle_ts, ltp)
             else:
-                # Update current
                 current['high'] = max(current['high'], ltp)
                 current['low'] = min(current['low'], ltp)
                 current['close'] = ltp
@@ -410,14 +401,9 @@ class LiveCandleAggregator:
         return {'security_id': sec_id, 'ts': ts, 'open': price, 'high': price, 'low': price, 'close': price}
 
     def finalize_candle(self, candle):
-        """
-        1. Stores candle in Redis List (History).
-        2. Pushes candle to Redis Stream (Real-time Algo).
-        """
         symbol = SECURITY_ID_TO_SYMBOL.get(candle['security_id'])
         if not symbol: return
 
-        # Format Payload
         payload = {
             'symbol': symbol,
             'security_id': candle['security_id'],
@@ -429,15 +415,10 @@ class LiveCandleAggregator:
         }
         payload_json = json.dumps(payload)
 
-        # A. HISTORY: Push to Redis List (Right Push)
-        # Key format: history:1333:1m
         history_key = f"{settings.HISTORY_KEY_PREFIX}:{candle['security_id']}:1m"
         self.r.rpush(history_key, payload_json)
-        
-        # Keep only 1 day of history (375 minutes + buffer = 400)
         self.r.ltrim(history_key, -400, -1) 
 
-        # B. STREAM: Push to Algo Stream
         try:
             self.r.xadd(settings.REDIS_STREAM_CANDLES, {'p': payload_json})
         except Exception as e:
@@ -445,7 +426,6 @@ class LiveCandleAggregator:
 
 # --- Worker Logic ---
 
-# Global Aggregator Instance
 aggregator = LiveCandleAggregator(r)
 
 def get_dhan_context(client_id: str, token: str) -> Optional[DhanContext]:
@@ -458,7 +438,6 @@ def build_subscription_list() -> List[tuple]:
     lst = []
     try:
         for symbol, security_id in settings.SECURITY_ID_MAP.items():
-            # 1=NSE Equity, 4=Full Packet
             lst.append((1, str(security_id), 4)) 
         print(f"[{datetime.now()}] Subscribing to {len(lst)} instruments.")
         return lst
@@ -467,17 +446,19 @@ def build_subscription_list() -> List[tuple]:
         return []
 
 def on_market_feed_message(instance, message):
-    """Feeds the Aggregator instead of raw streaming."""
     try:
         if message:
-            # Process locally for aggregation
             aggregator.process_tick(message)
-            # Optional: Also push raw ticks to market stream if needed by UI
-            # r.xadd(settings.REDIS_STREAM_MARKET, {'p': json.dumps(message)}, maxlen=10000, approximate=True)
     except Exception:
         pass
 
 def run_market_feed_worker(dhan_context):
+    """Runs the MarketFeed in a dedicated thread with its own event loop."""
+    
+    # CRITICAL FIX: Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     while True:
         try:
             print(f"[{datetime.now()}] MarketFeed: Connecting...")
@@ -489,7 +470,6 @@ def run_market_feed_worker(dhan_context):
             time.sleep(5)
 
 def on_order_update_message(order_data):
-    """Pushes Order Updates to Stream."""
     try:
         payload = order_data.get('Data', order_data)
         if payload:
@@ -499,6 +479,12 @@ def on_order_update_message(order_data):
         print(f"Order Stream Error: {e}")
 
 def run_order_update_worker(dhan_context):
+    """Runs OrderUpdate in a dedicated thread with its own event loop."""
+    
+    # CRITICAL FIX: Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     while True:
         try:
             print(f"[{datetime.now()}] OrderUpdate: Connecting...")
@@ -529,6 +515,7 @@ def main_worker_loop():
         r.set(settings.REDIS_STATUS_DATA_ENGINE, 'FATAL_ERROR_NO_INSTRUMENTS')
         return
 
+    # Start Threads
     t1 = threading.Thread(target=run_market_feed_worker, args=(dhan_context,), daemon=True)
     t2 = threading.Thread(target=run_order_update_worker, args=(dhan_context,), daemon=True)
     t1.start()
