@@ -1,211 +1,261 @@
 import csv
 import io
-import json
-import logging
-import os
-import time
-from datetime import datetime
-from typing import Optional, Dict, Any
-
-import redis
+from django.shortcuts import render, redirect
 from django.conf import settings
 from django.contrib import messages
-from django.shortcuts import render, redirect
 from django.utils import timezone
+from datetime import datetime
+import redis
+import json
+import time
+import requests
+from typing import Dict, Optional, Any
+from django.db import transaction
 
-# Import requests for making HTTP requests (used by CSV upload)
-import requests 
-
-# --- FIX: Robust/Lazy Import of Dhan SDK components ---
-# Import the client function and context conditionally to prevent module-level crashes
-try:
-    from dhanhq import DhanContext, dhanhq
-except ImportError:
-    # Define placeholder class/function if import fails early 
-    class DhanContext:
-        def __init__(self, client_id, access_token): pass
-    dhanhq = lambda ctx: None
-    
-# --- Import Models and Forms ---
+# --- Model and Form Imports ---
 from .models import DhanCredentials, StrategySettings, CashBreakoutTrade 
-from .forms import DhanCredentialsForm, StrategySettingsForm
+from .forms import DhanCredentialsForm, StrategySettingsForm, InstrumentUploadForm
 
-logger = logging.getLogger(__name__)
+# --- Global Redis Connection ---
+# We use a global variable 'r' and initialize it once, ensuring SSL skip for Heroku Redis
+r = None
+try:
+    r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+    r.ping()
+except Exception as e:
+    print(f"CRITICAL REDIS CONNECTION ERROR: {e}. Dashboard functionality limited.")
 
-# --- Redis Initialization ---
-def initialize_redis():
-    """Initializes Redis connection with Heroku SSL fix."""
-    try:
-        # CRITICAL FIX: Add ssl_cert_reqs=None and decode_responses=True for Heroku Redis SSL connection
-        r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-        r.ping()
-        return r
-    except Exception as e:
-        logger.error(f"REDIS CONNECTION ERROR: {e}")
-        return None 
-
-r = initialize_redis()
-
-# --- Global Helper for Dhan Client Initialization (LAZY IMPORT + FALLBACK) ---
+# --- Dhan SDK Client Helper ---
 def get_dhan_rest_client(client_id: str, access_token: str) -> Optional[object]:
-    """Initializes and returns the Dhan REST client using the most compatible pattern."""
-    dhan = None
+    """Initializes the Dhan REST client robustly, handling import version differences."""
+    if not access_token or not client_id:
+        return None
+    
     try:
-        # Re-import inside function body to catch any post-startup installs
+        # Preferred/documented v2 import
         from dhanhq import DhanContext, dhanhq 
         dhan_context = DhanContext(client_id, access_token) 
-        dhan = dhanhq(dhan_context) 
+        dhan = dhanhq(dhan_context)
         return dhan
+    except ImportError:
+        # This fallback is for safety, but the primary import structure should be relied upon
+        try:
+            import dhanhq
+            dhan = dhanhq.dhanhq(client_id, access_token)
+            return dhan
+        except Exception as e:
+            print(f"Dhan Client Initialization Failed: {e}")
+            return None
     except Exception as e:
-        logger.error(f"Dhan Client Initialization FAILED: {e}")
+        print(f"Dhan Client Initialization Failed (Invalid Token/Context): {e}")
         return None
 
-# --- Django Views ---
+
+# --- CSV Handling Helper (Uses specific CSV headers) ---
+def _process_uploaded_csv(csv_file) -> Dict[str, Dict[str, str]]:
+    """
+    Reads the uploaded Dhan Scrip Master CSV, filters for Nifty 500,
+    and returns a map: {SYMBOL_NAME: {security_id, exchange_segment, symbol}}.
+    """
+    instrument_map: Dict[str, Dict[str, str]] = {}
+    
+    # Read the file content
+    file_data = csv_file.read().decode('utf-8')
+    f = io.StringIO(file_data)
+    reader = csv.DictReader(f)
+    
+    target_symbols = set(settings.NIFTY_500_STOCKS)
+
+    for row in reader:
+        try:
+            # Use the exact uppercase column names identified from the CSV provided by the user
+            symbol = row['SYMBOL_NAME'] 
+            security_id = row['SECURITY_ID']
+            exchange_segment = row['SEGMENT'] # Using SEGMENT as the exchange segment identifier
+            
+            if symbol and security_id and exchange_segment and symbol in target_symbols:
+                instrument_map[symbol] = {
+                    'security_id': str(security_id),
+                    'exchange_segment': exchange_segment,
+                    'symbol': symbol,
+                }
+        except KeyError:
+            # Handle cases where expected headers might be missing (should be rare with known CSV structure)
+            continue
+        except Exception:
+            # Skip invalid rows
+            continue
+            
+    return instrument_map
+
+
+# --- Main Views ---
 
 def dashboard_view(request):
-    """Main dashboard for credentials, settings, and trade monitoring, and all POST handlers."""
+    """Main dashboard for credentials, settings, and trade monitoring."""
     global r
-    if r is None: r = initialize_redis() # Try reconnecting redis if down
-    
-    # 1. Strategy Settings (Critical for app load, handles initial setup)
+
+    # 1. Ensure Strategy Settings exist
     try:
         strategy, created = StrategySettings.objects.get_or_create(
             name='Cash Breakout Strategy',
-            defaults={'is_enabled': False, 'name': 'Cash Breakout Strategy'}
+            defaults={
+                'is_enabled': False,
+                'name': 'Cash Breakout Strategy',
+            }
         )
     except Exception as e:
-        logger.critical(f"DATABASE ERROR during StrategySettings lookup: {e}")
-        return render(request, 'dashboard/index.html', {'error_message': f"Critical DB Error: Tables missing ({e}). Run migrations."})
+        messages.error(request, f"Database Error during initialization. Run migrations: {e}")
+        strategy = None 
+        return render(request, 'dashboard/index.html', {'error_message': 'Critical Database Error: Tables not found.'})
 
     # 2. Handle Credentials Management
     try:
         credentials = DhanCredentials.objects.get(is_active=True)
     except DhanCredentials.DoesNotExist:
         credentials = DhanCredentials(client_id=settings.DHAN_CLIENT_ID or 'Enter Client ID')
-
+    
+    
     # --- POST Handlers ---
     if request.method == 'POST':
-        form = DhanCredentialsForm(request.POST, instance=credentials)
         
+        # A. Handle CSV Upload and Instrument Caching
+        if 'upload_instruments' in request.POST:
+            upload_form = InstrumentUploadForm(request.POST, request.FILES)
+            if upload_form.is_valid() and request.FILES.get('instrument_csv'):
+                try:
+                    instrument_map = _process_uploaded_csv(request.FILES['instrument_csv'])
+                    
+                    if not instrument_map:
+                        messages.error(request, "CSV processing failed: Could not find any matching Nifty 500 symbols.")
+                    elif r:
+                        r.set(settings.SYMBOL_ID_MAP_KEY, json.dumps(instrument_map))
+                        messages.success(request, f"Successfully cached {len(instrument_map)} Nifty instruments to Redis.")
+                    else:
+                        messages.error(request, "Redis is unavailable. Cannot cache instrument map.")
+                except Exception as e:
+                    messages.error(request, f"CSV Upload Failed: {e}")
+            else:
+                messages.error(request, "Invalid form submission for instrument upload.")
+            return redirect('dashboard')
+            
+        # B. Handle Credentials Update
         if 'update_credentials' in request.POST:
-            # Handler for saving Client ID
+            form = DhanCredentialsForm(request.POST, instance=credentials)
             if form.is_valid():
                 creds = form.save(commit=False)
                 creds.is_active = True
                 creds.save()
                 messages.success(request, "Dhan Client ID updated.")
-                return redirect('dashboard')
             else:
                 messages.error(request, "Error saving credentials.")
-
-        elif 'activate_token' in request.POST:
-            # Handler for Manual Token Activation
-            manual_token = request.POST.get('manual_access_token')
-            client_id = request.POST.get('client_id')
-            
-            if not manual_token or not client_id:
-                messages.error(request, "Client ID and Access Token must be provided for activation.")
-                return redirect('dashboard')
-            
-            # 1. Save Token to DB
-            credentials.access_token = manual_token.strip()
-            credentials.token_generation_time = timezone.now()
-            credentials.client_id = client_id.strip() 
-            credentials.save()
-            
-            # 2. Distribute Token via Redis
-            if r:
-                r.set(settings.REDIS_DHAN_TOKEN_KEY, credentials.access_token)
-                r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({
-                    'action': 'TOKEN_REFRESH', 
-                    'token': credentials.access_token
-                }))
-                
-            messages.success(request, "Trading session activated! Token distributed to workers.")
             return redirect('dashboard')
             
-        elif 'update_strategy' in request.POST:
-            # Handler for Strategy Settings Update
+        # C. Handle Manual Access Token Activation
+        if 'activate_token' in request.POST:
+            token_to_save = request.POST.get('manual_access_token', '').strip()
+            
+            if not token_to_save or token_to_save == credentials.access_token:
+                messages.error(request, "Please paste a new, valid Access Token.")
+                return redirect('dashboard')
+
+            # --- Activation Logic ---
+            credentials.access_token = token_to_save
+            credentials.token_generation_time = timezone.now()
+            credentials.save()
+            
+            # Publish token update to all workers and save to a persistent Redis key
+            if r:
+                r.set(settings.REDIS_DHAN_TOKEN_KEY, token_to_save)
+                # Signal workers to re-initialize client
+                r.publish(settings.REDIS_AUTH_CHANNEL, json.dumps({'action': 'TOKEN_REFRESH', 'token': token_to_save}))
+            
+            messages.success(request, f"Access Token activated and distributed to workers. Token: {token_to_save[:15]}...")
+            return redirect('dashboard')
+
+        # D. Handle Strategy Settings Update
+        if 'update_strategy' in request.POST:
             strategy_form = StrategySettingsForm(request.POST, instance=strategy)
             if strategy_form.is_valid():
                 strategy_form.save()
                 messages.success(request, f"Strategy '{strategy.name}' settings updated.")
                 
-                # NOTIFY ALGO ENGINES VIA REDIS
+                # --- NOTIFY ALGO ENGINES VIA REDIS ---
                 if r:
-                    r.publish(settings.REDIS_CONTROL_CHANNEL, json.dumps({'action': 'UPDATE_CONFIG'}))
+                    r.publish(settings.REDIS_CONTROL_CHANNEL, json.dumps({
+                        'action': 'UPDATE_CONFIG'
+                    }))
                 
                 return redirect('dashboard')
             else:
                 messages.error(request, "Error saving strategy settings.")
-                
-        elif 'upload_instruments' in request.POST:
-            # --- Handler for CSV Instrument Upload and Caching ---
-            if 'instrument_csv' not in request.FILES:
-                messages.error(request, "No CSV file was uploaded.")
-                return redirect('dashboard')
-
-            csv_file = request.FILES['instrument_csv']
-            
-            if not csv_file.name.endswith('.csv'):
-                messages.error(request, "File must be a CSV format.")
-                return redirect('dashboard')
-
+                # Fall through to re-render form with errors
+        
+        # E. Manual Trade Actions (Square Off / Cancel Entry)
+        trade_id = request.POST.get('trade_id')
+        if trade_id and r:
             try:
-                # Read file content into a string buffer
-                file_data = csv_file.read().decode('utf-8')
-                io_string = io.StringIO(file_data)
+                trade = CashBreakoutTrade.objects.get(pk=trade_id)
+                dhan = get_dhan_rest_client(credentials.client_id, credentials.access_token)
                 
-                # Use Django's settings list for filtering
-                target_symbols = set(settings.NIFTY_500_STOCKS) 
-                instrument_map: Dict[str, Dict[str, str]] = {}
-                
-                # Use DictReader for easy column access
-                reader = csv.DictReader(io_string)
+                if dhan:
+                    if 'manual_square_off' in request.POST and trade.status == 'OPEN':
+                        # Place Market SELL order to exit long position
+                        response = dhan.place_order(
+                            security_id=trade.security_id,
+                            exchange_segment=dhan.NSE, # Assuming NSE equity for cash market
+                            transaction_type=dhan.SELL,
+                            quantity=abs(trade.quantity),
+                            order_type=dhan.MARKET,
+                            product_type=dhan.INTRA
+                        )
+                        if response.get('orderId'):
+                            trade.status = 'PENDING_EXIT'
+                            trade.exit_order_id = response['orderId']
+                            trade.exit_reason = 'MANUAL SQUARE OFF'
+                            trade.save()
+                            messages.warning(request, f"Manual Square Off order placed for {trade.symbol}. Waiting for fill status.")
+                        else:
+                            messages.error(request, f"API Error squaring off {trade.symbol}: {response.get('message', 'Unknown')}")
+                            
+                    elif 'manual_cancel_entry' in request.POST and trade.status == 'PENDING_ENTRY' and trade.entry_order_id:
+                        # Cancel the pending SLM entry order
+                        response = dhan.cancel_order(trade.entry_order_id)
+                        
+                        if response.get('status') == 'success' or 'cancel order success' in response.get('message', '').lower():
+                            trade.status = 'EXPIRED'
+                            trade.exit_reason = 'MANUAL CANCELLED'
+                            trade.save()
+                            messages.success(request, f"Pending entry for {trade.symbol} cancelled.")
+                        else:
+                            messages.error(request, f"API Error cancelling {trade.symbol}: {response.get('message', 'Unknown')}")
 
-                for row in reader:
-                    # Robustly handle common field names from Dhan CSV
-                    symbol = row.get("tradingSymbol") or row.get("symbol")
-                    security_id = row.get("securityId") or row.get("security_id")
-                    exchange_segment = row.get("exchangeSegment") or row.get("exchange_segment")
+                    # Notify algo engines to update state
+                    r.publish(settings.REDIS_CONTROL_CHANNEL, json.dumps({'action': 'UPDATE_CONFIG'}))
 
-                    if symbol and security_id and exchange_segment and symbol in target_symbols:
-                        instrument_map[symbol] = {
-                            "security_id": str(security_id),
-                            "exchange_segment": exchange_segment,
-                            "symbol": symbol,
-                        }
-                
-                if instrument_map and r:
-                    # Cache Results in Redis
-                    r.set(settings.SYMBOL_ID_MAP_KEY, json.dumps(instrument_map))
-                    messages.success(request, f"Successfully cached {len(instrument_map)} Nifty instruments from CSV!")
-                    
-                    # Log missing symbols for user feedback (optional)
-                    missing_count = len(target_symbols) - len(instrument_map)
-                    if missing_count > 0:
-                        messages.warning(request, f"{missing_count} symbols from the Nifty list were not found in the CSV.")
+                else:
+                    messages.error(request, "Dhan Client not initialized. Check Access Token and Client ID.")
 
-                elif not instrument_map:
-                    messages.error(request, "CSV processing failed: Could not find any matching Nifty 500 symbols.")
-                    
+            except CashBreakoutTrade.DoesNotExist:
+                messages.error(request, "Trade not found.")
             except Exception as e:
-                logger.error(f"CSV Processing Error: {e}")
-                messages.error(request, f"Failed to process CSV file: {e}")
-                
+                messages.error(request, f"Manual Action Failed: {e}")
+            
             return redirect('dashboard')
+            
+    # --- GET Context Preparation ---
 
-    else: # GET request
-        form = DhanCredentialsForm(instance=credentials)
-        strategy_form = StrategySettingsForm(instance=strategy)
-
-
-    # 4. Live Trade Status and Monitoring
+    # Initialize forms based on current DB state
+    form = DhanCredentialsForm(instance=credentials)
+    strategy_form = StrategySettingsForm(instance=strategy)
+    upload_form = InstrumentUploadForm() # Always fresh for GET request
+    
+    # Live Trade Status and Monitoring
     live_trades = CashBreakoutTrade.objects.filter(
         status__in=['PENDING_ENTRY', 'OPEN', 'PENDING_EXIT']
     ).order_by('-created_at')
     
-    # 5. Global Status Check (from Redis)
+    # Global Status Check (from Redis)
     data_engine_status = r.get(settings.REDIS_STATUS_DATA_ENGINE) if r else 'N/A (Redis Down)'
     algo_engine_status = r.get(settings.REDIS_STATUS_ALGO_ENGINE) if r else 'N/A (Redis Down)'
     
@@ -213,10 +263,9 @@ def dashboard_view(request):
         'form': form,
         'credentials': credentials,
         'strategy_form': strategy_form,
+        'upload_form': upload_form,
         'live_trades': live_trades,
         'data_engine_status': data_engine_status,
         'algo_engine_status': algo_engine_status,
-        # NOTE: The instrument upload form is handled by the main POST, but we need
-        # the forms defined for successful GET rendering.
     }
     return render(request, 'dashboard/index.html', context)
