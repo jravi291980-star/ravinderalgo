@@ -1,6 +1,6 @@
 Django==5.0.*
 gunicorn
-dhanhq>=2.1.0.
+dhanhq>=2.1.0
 redis==5.0.*
 requests==2.31.*
 tenacity==8.2.*
