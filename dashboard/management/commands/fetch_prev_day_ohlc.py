@@ -1,6 +1,7 @@
 # dashboard/management/commands/fetch_prev_day_ohlc.py
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -8,25 +9,30 @@ from django.core.management.base import BaseCommand, CommandError
 from django.conf import settings
 import redis
 
-# --- Robust Dhan SDK Import ---
-try:
-    from dhanhq import DhanContext, dhanhq
-except ImportError:
-    # Fallback placeholders if import fails
-    class DhanContext:
-        def __init__(self, client_id, access_token): pass
-    dhanhq = lambda ctx: None
-
-def get_dhan_client(client_id: str, token: str) -> Optional[object]:
-    """Initializes the Dhan REST client robustly."""
-    if not token:
+# --- Global Helper for Dhan Client Initialization (Robust) ---
+def get_dhan_client(client_id: str, access_token: str) -> Optional[object]:
+    """
+    Initializes and returns the Dhan REST client using the most compatible
+    DhanHQ SDK pattern, handling version differences on Heroku.
+    """
+    if not access_token or not client_id:
         return None
+    
     try:
-        from dhanhq import DhanContext, dhanhq
-        dhan_context = DhanContext(client_id, token)
-        dhan = dhanhq(dhan_context)
+        # A. RECOMMENDED: Try the current v2.1+ context-based pattern
+        from dhanhq import DhanContext, dhanhq 
+        dhan_context = DhanContext(client_id, access_token) 
+        dhan = dhanhq(dhan_context) 
         return dhan
-    except Exception as e:
+    except ImportError:
+        try:
+            # B. FALLBACK: Try the older v1 direct instantiation pattern
+            import dhanhq
+            dhan = dhanhq.dhanhq(client_id, access_token)
+            return dhan
+        except Exception:
+            return None
+    except Exception:
         return None
 
 class Command(BaseCommand):
@@ -44,15 +50,17 @@ class Command(BaseCommand):
         except Exception as e:
             raise CommandError(f"Failed to connect/authenticate Redis: {e}")
 
-        # 2. Initialize Dhan Client
+        # 2. Initialize Dhan Client (Robustly)
         dhan = get_dhan_client(settings.DHAN_CLIENT_ID, token)
+        
         if not dhan:
-            raise CommandError("Failed to initialize Dhan Client. Check library installation or Token.")
+            # Provide specific debugging info
+            raise CommandError(f"Failed to initialize Dhan Client. Client ID: {settings.DHAN_CLIENT_ID}, Token Length: {len(token) if token else 0}. Check library version.")
 
         # 3. Prepare Date Range (Last 5 days to handle weekends/holidays)
         today = datetime.now()
-        from_date_obj = today - timedelta(days=5) # Look back 5 days to ensure we find the last trading session
-        to_date_obj = today - timedelta(days=1)   # Up to yesterday
+        from_date_obj = today - timedelta(days=5) 
+        to_date_obj = today - timedelta(days=1)   
         
         from_date = from_date_obj.strftime('%Y-%m-%d')
         to_date = to_date_obj.strftime('%Y-%m-%d')
@@ -69,14 +77,11 @@ class Command(BaseCommand):
 
         # 4. Iterate and Fetch Data
         for symbol, security_id in instrument_map.items():
-            # In the settings map, values are just Security IDs (int/str)
-            # Exchange segment is implicitly NSE_EQ (Equity)
-            
             try:
                 # API Call: Historical Daily Data
                 response = dhan.historical_daily_data(
                     security_id=str(security_id),
-                    exchange_segment=dhan.NSE, # Use NSE constant from client
+                    exchange_segment=dhan.NSE, 
                     instrument_type='EQ',
                     from_date=from_date,
                     to_date=to_date
@@ -86,7 +91,6 @@ class Command(BaseCommand):
                     data_list = response['data']
                     if data_list:
                         # Get the LAST candle in the list (most recent trading day)
-                        # Dhan returns data in chronological order usually, but last item is safest
                         prev_day_candle = data_list[-1]
                         
                         # Store essential breakout reference points
@@ -98,29 +102,26 @@ class Command(BaseCommand):
                         })
                         processed_count += 1
                 else:
-                    # Silent fail for individual stocks to keep process moving, but track errors
                     error_count += 1
             
-            except Exception as e:
-                # Rate limit protection (simple sleep if errors start spiking)
+            except Exception:
+                # Simple backoff
                 time.sleep(0.05) 
                 error_count += 1
                 continue
             
-            # Gentle rate limiting (Dhan has limits around 10-25 req/sec)
-            # Fetching 500 stocks at full speed might trigger 429s.
+            # Gentle rate limiting
             if processed_count % 10 == 0:
-                time.sleep(0.2)
+                time.sleep(0.1)
 
         # 5. Atomic Save to Redis
         if ohlc_data_to_cache:
             try:
-                # Store all PDH data in a single Redis Hash
                 r.hmset(settings.PREV_DAY_HASH, ohlc_data_to_cache)
                 self.stdout.write(self.style.SUCCESS(f"Successfully cached PDH/PDL for {processed_count} instruments to Redis key: {settings.PREV_DAY_HASH}"))
                 
                 if error_count > 0:
-                    self.stdout.write(self.style.WARNING(f"Failed to fetch data for {error_count} instruments (likely invalid ID or delisted)."))
+                    self.stdout.write(self.style.WARNING(f"Failed to fetch data for {error_count} instruments."))
             
             except Exception as e:
                 raise CommandError(f"Failed to write data to Redis: {e}")
