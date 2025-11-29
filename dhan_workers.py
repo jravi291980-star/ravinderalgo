@@ -16,16 +16,52 @@ import django
 django.setup()
 from django.conf import settings
 
-# --- Robust Import ---
+# --- ROBUST IMPORT LOGIC ---
+DhanContext = None
+dhanhq = None
+MarketFeed = None
+OrderUpdate = None
+
 try:
+    # 1. Try importing everything from top level (v2.1+ standard)
     from dhanhq import DhanContext, dhanhq, MarketFeed, OrderUpdate
 except ImportError:
-    class DhanContext:
-        def __init__(self, client_id, access_token): pass
-    MarketFeed = lambda: None
-    OrderUpdate = lambda: None
+    try:
+        # 2. Try submodule imports (Common in v2.0.x)
+        from dhanhq import DhanContext, dhanhq
+        from dhanhq.marketfeed import MarketFeed
+        from dhanhq.order_update import OrderUpdate
+    except ImportError:
+        print("CRITICAL: Failed to import DhanHQ library components. Using Fallback Mocks.")
+        
+        # 3. Define Safe Fallbacks (Prevents 'AttributeError' crash)
+        class DhanContext:
+            def __init__(self, client_id, access_token): pass
+            
+        class MarketFeed:
+            # Define constants expected by the code
+            Ticker = 1
+            Quote = 2
+            Depth = 3
+            Full = 4 # <--- This fixes the 'no attribute Full' error
+            
+            def __init__(self, context, instruments, version): 
+                self.context = context
+                self.instruments = instruments
+            def on_message(self, msg): pass
+            def run_forever(self): 
+                print("Mock MarketFeed running (no data)...")
+                time.sleep(10)
+                
+        class OrderUpdate:
+            def __init__(self, context): pass
+            def on_update(self, msg): pass
+            def connect_to_dhan_websocket_sync(self):
+                print("Mock OrderUpdate running (no data)...")
+                time.sleep(10)
 
 # --- Configuration ---
+# Use ssl_cert_reqs=None for Heroku Redis
 r = redis.from_url(settings.REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
 
 INSTRUMENTS_TO_SUBSCRIBE: List[tuple] = []
@@ -37,13 +73,27 @@ def get_dhan_context(client_id: str, token: str) -> Optional[DhanContext]:
     except: return None
 
 def build_subscription_list() -> List[tuple]:
+    """
+    Constructs the subscription list directly from settings.SECURITY_ID_MAP.
+    """
     subscription_list = []
     try:
+        # Load map from Django settings
         instrument_map = settings.SECURITY_ID_MAP
+        
         for symbol, security_id in instrument_map.items():
-            subscription_list.append((1, str(security_id), MarketFeed.Full))
+            # Dhan MarketFeed expects: (ExchangeSegment, SecurityID, Mode)
+            # We assume NSE_EQ (1) for all symbols in the map.
+            # We use MarketFeed.Full (Constant value 4)
+            subscription_list.append((
+                1, 
+                str(security_id), 
+                MarketFeed.Full
+            ))
+            
         print(f"[{datetime.now()}] Configured {len(subscription_list)} instruments from Settings.")
         return subscription_list
+
     except Exception as e:
         print(f"[{datetime.now()}] ERROR building subscription list: {e}")
         return []
@@ -51,13 +101,9 @@ def build_subscription_list() -> List[tuple]:
 # --- STREAM PRODUCERS (XADD) ---
 
 def on_market_feed_message(instance, message):
-    """
-    Pushes market data to Redis Stream.
-    We use maxlen=20000 to keep only recent history and prevent Redis memory overflow.
-    """
+    """Pushes market data to Redis Stream."""
     try:
-        # XADD key ID field string-value ...
-        # We store the JSON payload under the field 'p' (payload)
+        # 'p' key holds the JSON payload
         r.xadd(
             settings.REDIS_STREAM_MARKET, 
             {'p': json.dumps(message)}, 
@@ -71,6 +117,7 @@ def run_market_feed_worker(dhan_context):
     while True:
         try:
             print(f"[{datetime.now()}] MarketFeed: Connecting...")
+            # Initialize with context, instruments list, and version
             market_client = MarketFeed(dhan_context, INSTRUMENTS_TO_SUBSCRIBE, version="v2")
             market_client.on_message = on_market_feed_message
             market_client.run_forever()
@@ -79,10 +126,7 @@ def run_market_feed_worker(dhan_context):
             time.sleep(5)
 
 def on_order_update_message(order_data):
-    """
-    Pushes Order Updates to Redis Stream.
-    NO maxlen here. Order updates are critical and must be persisted until consumed.
-    """
+    """Pushes Order Updates to Redis Stream."""
     try:
         r.xadd(
             settings.REDIS_STREAM_ORDERS, 
@@ -117,9 +161,12 @@ def main_worker_loop():
 
     dhan_context = get_dhan_context(settings.DHAN_CLIENT_ID, token)
     
+    # Build list (This triggered the previous error)
     INSTRUMENTS_TO_SUBSCRIBE = build_subscription_list()
+    
     if not INSTRUMENTS_TO_SUBSCRIBE:
         r.set(settings.REDIS_STATUS_DATA_ENGINE, 'FATAL_ERROR_NO_INSTRUMENTS')
+        print("No instruments found in settings map.")
         return
 
     # Start Threads
@@ -130,7 +177,7 @@ def main_worker_loop():
     order_thread.start()
 
     r.set(settings.REDIS_STATUS_DATA_ENGINE, 'RUNNING')
-    print("Data Engine Running (Streaming Mode).")
+    print("Data Engine Running (Stream Mode).")
     
     market_thread.join()
     order_thread.join()
