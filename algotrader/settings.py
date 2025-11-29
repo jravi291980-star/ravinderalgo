@@ -1,13 +1,19 @@
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
-import dj_database_url 
+import dj_database_url # For configuring PostgreSQL connection
 
 # --- CORE DJANGO CONFIGURATION ---
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-key')
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-default-key-for-local-dev-change-me')
+
+# SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
+
+# Allow all hosts (*) for Heroku deployment
 ALLOWED_HOSTS = ['*']
 
 INSTALLED_APPS = [
@@ -17,12 +23,13 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'dashboard',
+    'dashboard', # Our main application containing models and dashboard UI
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
+    # WhiteNoise middleware should be used immediately after SecurityMiddleware for static files
+    'whitenoise.middleware.WhiteNoiseMiddleware', 
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -32,70 +39,11 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'algotrader.urls'
-WSGI_APPLICATION = 'algotrader.wsgi.application'
 
-# --- DATABASE CONFIGURATION ---
-if 'DATABASE_URL' in os.environ:
-    DATABASES = {
-        'default': dj_database_url.config(
-            default=os.environ.get('DATABASE_URL'), conn_max_age=600, ssl_require=True
-        )
-    }
-else:
-    DATABASES = {
-        'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': os.path.join(BASE_DIR, 'db.sqlite3')}
-    }
-
-# --- REDIS CONFIGURATION ---
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-
-CACHES = {
-    "default": {
-        "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": REDIS_URL,
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            "CONNECTION_POOL_KWARGS": {"ssl_cert_reqs": None} 
-        }
-    }
-}
-
-# --- REDIS STREAMS CONFIGURATION (NEW) ---
-# We use Streams instead of Pub/Sub for persistence and reliability
-REDIS_STREAM_MARKET = 'stream:dhan:market'        # High volume tick data
-REDIS_STREAM_ORDERS = 'stream:dhan:orders'        # Critical order updates
-REDIS_STREAM_CONTROL = 'stream:algo:control'      # Admin commands (Settings/Auth)
-
-# Consumer Group Settings
-REDIS_CONSUMER_GROUP = 'algo_engine_group'
-REDIS_CONSUMER_NAME = f"algo_worker_{os.environ.get('DYNO', 'local')}"
-
-# Status Keys
-REDIS_STATUS_DATA_ENGINE = 'data_engine_status'
-REDIS_STATUS_ALGO_ENGINE = 'algo_engine_status'
-REDIS_DHAN_TOKEN_KEY = 'dhan_access_token'
-SYMBOL_ID_MAP_KEY = 'dhan_instrument_map'
-PREV_DAY_HASH = 'prev_day_ohlc'
-LIVE_OHLC_KEY = 'live_ohlc_data'
-
-# --- STATIC FILES ---
-STATIC_URL = '/static/'
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
-
-# --- TIMEZONE ---
-LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'Asia/Kolkata'
-IST = pytz.timezone("Asia/Kolkata")
-USE_I18N = True
-USE_TZ = True
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
-# --- TEMPLATES ---
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [os.path.join(BASE_DIR, 'templates')],
+        'DIRS': [BASE_DIR / 'templates'], 
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -108,22 +56,98 @@ TEMPLATES = [
     },
 ]
 
-# --- DHAN API CONSTANTS ---
+WSGI_APPLICATION = 'algotrader.wsgi.application'
+
+
+# --- DATABASE CONFIGURATION (PostgreSQL/SQLite Switch) ---
+if 'DATABASE_URL' in os.environ:
+    # Use the database URL provided by the Heroku Postgres add-on
+    DATABASES = {
+        'default': dj_database_url.config(
+            default=os.environ.get('DATABASE_URL'), 
+            conn_max_age=600, 
+            ssl_require=True
+        )
+    }
+else:
+    # Fallback for local development (SQLite)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+
+
+# --- Password Validation, Time Zones, and i18n ---
+AUTH_PASSWORD_VALIDATORS = [
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',},
+]
+
+LANGUAGE_CODE = 'en-us'
+TIME_ZONE = 'UTC'
+USE_I18N = True
+USE_TZ = True
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# --- STATIC FILES CONFIGURATION (FIX FOR HEROKU DEPLOYMENT) ---
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles' 
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+
+# --- TIMEZONE CONSTANTS ---
+IST = pytz.timezone("Asia/Kolkata")
+
+
+# -------------------------------------------------------------------
+# --- REDIS CONFIGURATION AND CHANNELS (LOW-LATENCY BUS) ---
+# -------------------------------------------------------------------
+
+# REDIS_URL environment variable is set by Heroku Redis Addon
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+
+# --- MISSING CONSTANTS RESTORED BELOW ---
+
+# Pub/Sub & Stream Channels
+REDIS_DATA_CHANNEL = 'dhan_market_data'       # Legacy/Backup channel
+REDIS_STREAM_MARKET = 'stream:dhan:market'    # Main Market Data Stream
+REDIS_STREAM_ORDERS = 'stream:dhan:orders'    # Order Updates Stream
+REDIS_STREAM_CONTROL = 'stream:algo:control'  # Control Signals Stream
+
+# Control Channels (Used by Dashboard)
+REDIS_CONTROL_CHANNEL = 'strategy_control_channel' 
+REDIS_AUTH_CHANNEL = 'auth_channel'          # <--- THIS WAS MISSING
+
+# Consumer Group Config
+REDIS_CONSUMER_GROUP = 'algo_engine_group'
+REDIS_CONSUMER_NAME = f"algo_worker_{os.environ.get('DYNO', 'local')}"
+
+# Status Keys and Mappings
+REDIS_STATUS_DATA_ENGINE = 'data_engine_status'
+REDIS_STATUS_ALGO_ENGINE = 'algo_engine_status'
+REDIS_DHAN_TOKEN_KEY = 'dhan_access_token'   # Key where live token is stored
+PREV_DAY_HASH = 'prev_day_ohlc'             # T-1 High/Low/Close data
+LIVE_OHLC_KEY = 'live_ohlc_data'            # Current LTP snapshot for monitoring
+SYMBOL_ID_MAP_KEY = 'dhan_instrument_map'   # (Legacy)
+
+# --- DHAN API CONFIGURATION KEYS ---
 DHAN_CLIENT_ID = os.environ.get('DHAN_CLIENT_ID')
-DHAN_API_SECRET = os.environ.get('DHAN_API_SECRET')
-DHAN_REDIRECT_URI = os.environ.get('DHAN_REDIRECT_URI')
 
 # --- STRATEGY CONSTANTS ---
 RISK_MULTIPLIER = 2.5
 BREAKEVEN_TRIGGER_R = 1.25
 MAX_MONITORING_MINUTES = 6
+
 ENTRY_OFFSET_PCT = 0.0001
 STOP_OFFSET_PCT = 0.0002
 MAX_CANDLE_PCT = 0.007
 
 # --- NIFTY 500 SECURITY ID MAP (Static Data Source) ---
 # This dictionary maps the Symbol (key) to the Dhan Security ID (value).
-# Exchange segment is implicitly NSE_EQ (1) for cash market trading.
 SECURITY_ID_MAP = {
     '360ONE': 13061, '3MINDIA': 474, 'AADHARHFC': 23729, 'AARTIIND': 7, 'AAVAS': 5385, 'ABB': 13, 
     'ABBOTINDIA': 17903, 'ABCAPITAL': 21614, 'ABFRL': 30108, 'ABLBL': 756843, 'ABREL': 625, 
@@ -231,4 +255,5 @@ SECURITY_ID_MAP = {
     'ZYDUSLIFE': 7929
 }
 
+# --- Target symbol list derived from the map keys ---
 NIFTY_500_STOCKS = list(SECURITY_ID_MAP.keys())
