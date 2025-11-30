@@ -263,7 +263,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 import dj_database_url 
+from dotenv import load_dotenv # <--- ADDED: Load .env file for VPS
 
+# --- LOAD ENVIRONMENT VARIABLES ---
+load_dotenv()
 # --- CORE DJANGO CONFIGURATION ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -274,7 +277,8 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-default-key-fo
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
 # Allow all hosts (*) for Heroku deployment
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',')
+
 
 INSTALLED_APPS = [
     'django.contrib.admin',
